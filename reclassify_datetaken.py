@@ -10,7 +10,7 @@ PIL.Image.MAX_IMAGE_PIXELS = None
 
 DATETYPE = {0:"OS_DATE", 1:"EXIF"}
 
-directory = pathlib.Path(input("Please write(or drag) the path to process: "))
+directory = pathlib.Path(input("Please write(or drag) the path to process: ").strip("\""))
 
 def get_date(filename):
 	'''
@@ -22,7 +22,10 @@ def get_date(filename):
 	try:
 		with PIL.Image.open(filename) as image:
 			image.verify()
-			return (1, datetime.strptime(image._getexif()[36867], "%Y:%m:%d %H:%M:%S"))
+			try:
+				return (1, datetime.strptime(image._getexif()[36867], "%Y:%m:%d %H:%M:%S"))
+			except:
+				return (1, datetime.strptime(image.tag[36867][0], "%Y:%m:%d %H:%M:%S"))
 	except:
 		return (0, datetime.fromtimestamp(os.path.getmtime(filename)))
 
@@ -33,7 +36,7 @@ for File in directory.iterdir():
 			
 			FileDate = None
 			#Get all the files with the same stem
-			SameStemFiles = File.parent.glob(str(File.stem) + ".*")
+			SameStemFiles = list(File.parent.glob(str(File.stem) + ".*"))
 			for SameStemFile in SameStemFiles:
 				if FileDate:
 					SameStemFileDate = get_date(SameStemFile)
@@ -49,10 +52,9 @@ for File in directory.iterdir():
 			
 			#Copy all the files sharing the stem.
 			NewFolder = str(File.parent) + os.path.sep + FileDate[1].strftime("%Y-%m-%d")
-			
+
 			for SameStemFile in SameStemFiles:
 				print(FileDate[1].strftime("%Y-%m-%d %H:%M:%S") + "\t" + DATETYPE[FileDate[0]] , end="")
-				
 				if os.path.exists(NewFolder) == False:
 					os.mkdir(NewFolder)
 					shutil.move(SameStemFile, NewFolder + os.path.sep + str(SameStemFile.name))
