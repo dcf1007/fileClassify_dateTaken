@@ -18,15 +18,19 @@ def get_date(filename):
 		return datetime.fromtimestamp(os.path.getmtime(filename))
 
 for File in directory.iterdir():
-	if os.path.isfile(File):
+	if os.path.isfile(File) and str(File.suffix) != ".xmp":
 		FileDate = get_date(File)
 		print(FileDate.strftime("%Y-%m-%d %H:%M:%S") + "\t" + str(File.name))
 		NewFolder = str(File.parent) + os.path.sep + FileDate.strftime("%Y-%m-%d")
 		if os.path.exists(NewFolder) == False:
 			os.mkdir(NewFolder)
 			shutil.move(File, NewFolder + os.path.sep + str(File.name))
+			if os.path.exists(str(File.parent) + os.path.sep + str(File.stem) + ".xmp"):
+				shutil.move(str(File.parent) + os.path.sep + str(File.stem) + ".xmp", NewFolder + os.path.sep + str(File.stem) + ".xmp")
 		elif os.path.isfile(NewFolder) == True:
 				print(FileDate.strftime("%Y-%m-%d") + " exists as a file. Not moving " + str(File.name))
 		else:
 			shutil.move(File, NewFolder + os.path.sep + str(File.name))
+			if os.path.exists(str(File.parent) + os.path.sep + str(File.stem) + ".xmp"):
+				shutil.move(str(File.parent) + os.path.sep + str(File.stem) + ".xmp", NewFolder + os.path.sep + str(File.stem) + ".xmp")
 input("Press any key to exit")
