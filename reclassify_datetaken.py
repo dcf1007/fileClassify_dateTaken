@@ -5,17 +5,17 @@ import pathlib
 import PIL.Image
 from datetime import datetime
 
-directory = pathlib.Path("./example_files")
+directory = pathlib.Path(input("Please write(or drag) the path to process: "))
 
 def get_date(filename):
 	#The EXIF index to the DateOriginal code is 36867 (0x9003)
 	#The EXIF time is always in the following format: "YYYY:MM:DD HH:MM:SS" 
-	with PIL.Image.open(filename) as image:
-		image.verify()
-		try:
+	try:
+		with PIL.Image.open(filename) as image:
+			image.verify()
 			return datetime.strptime(image._getexif()[36867], "%Y:%m:%d %H:%M:%S")
-		except:
-			return datetime.fromtimestamp(os.path.getmtime(filename))
+	except:
+		return datetime.fromtimestamp(os.path.getmtime(filename))
 
 for File in directory.iterdir():
 	if os.path.isfile(File):
