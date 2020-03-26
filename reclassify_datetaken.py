@@ -5,5 +5,8 @@ import pathlib
 
 directory = pathlib.Path("./example_files")
 for File in directory.iterdir():
-	print(File)
+	if os.path.isfile(File):
+		print(File)
+	else:
+		print(str(File) + " <--- Folder: ignored")
 input("Press any key to exit")
