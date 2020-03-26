@@ -8,7 +8,7 @@ from datetime import datetime
 #Disable max pixels to avoid errors in RAW files and panoramas
 PIL.Image.MAX_IMAGE_PIXELS = None
 
-DATETYPE = {0:"OS_DATE", 1:"EXIF")
+DATETYPE = {0:"OS_DATE", 1:"EXIF"}
 
 directory = pathlib.Path(input("Please write(or drag) the path to process: "))
 
