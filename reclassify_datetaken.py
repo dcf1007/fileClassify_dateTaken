@@ -44,17 +44,15 @@ for File in directory.iterdir():
 			else:
 				FileDate = get_date(SameStemFile)
 		
-		print(FileDate[1].strftime("%Y-%m-%d %H:%M:%S"))
+		print(FileDate[1].strftime("%Y-%m-%d %H:%M:%S") + "\t", end="")
 		NewFolder = str(File.parent) + os.path.sep + FileDate[1].strftime("%Y-%m-%d")
 		if os.path.exists(NewFolder) == False:
 			os.mkdir(NewFolder)
 			shutil.move(File, NewFolder + os.path.sep + str(File.name))
-			if os.path.exists(str(File.parent) + os.path.sep + str(File.stem) + ".xmp"):
-				shutil.move(str(File.parent) + os.path.sep + str(File.stem) + ".xmp", NewFolder + os.path.sep + str(File.stem) + ".xmp")
+			print("OK")
 		elif os.path.isfile(NewFolder) == True:
-				print(FileDate[1].strftime("%Y-%m-%d") + " exists as a file. Not moving " + str(File.name))
+			print(FileDate[1].strftime("%Y-%m-%d") + " exists as a file. Not moving " + str(File.name))
 		else:
 			shutil.move(File, NewFolder + os.path.sep + str(File.name))
-			if os.path.exists(str(File.parent) + os.path.sep + str(File.stem) + ".xmp"):
-				shutil.move(str(File.parent) + os.path.sep + str(File.stem) + ".xmp", NewFolder + os.path.sep + str(File.stem) + ".xmp")
+			print("OK")
 input("Press any key to exit")
