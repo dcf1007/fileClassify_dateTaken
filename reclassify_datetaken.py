@@ -5,6 +5,9 @@ import pathlib
 import PIL.Image
 from datetime import datetime
 
+#Disable max pixels to avoid errors in RAW files and panoramas
+PIL.Image.MAX_IMAGE_PIXELS = None
+
 directory = pathlib.Path(input("Please write(or drag) the path to process: "))
 
 def get_date(filename):
@@ -16,7 +19,7 @@ def get_date(filename):
 	#The EXIF time is always in the following format: "YYYY:MM:DD HH:MM:SS" 
 	try:
 		with PIL.Image.open(filename) as image:
-			#image.verify()
+			image.verify()
 			return (1, datetime.strptime(image._getexif()[36867], "%Y:%m:%d %H:%M:%S"))
 	except:
 		return (0, datetime.fromtimestamp(os.path.getmtime(filename)))
