@@ -8,6 +8,8 @@ from datetime import datetime
 #Disable max pixels to avoid errors in RAW files and panoramas
 PIL.Image.MAX_IMAGE_PIXELS = None
 
+DATETYPE = {0:"OS_DATE", 1:"EXIF")
+
 directory = pathlib.Path(input("Please write(or drag) the path to process: "))
 
 def get_date(filename):
@@ -44,15 +46,15 @@ for File in directory.iterdir():
 			else:
 				FileDate = get_date(SameStemFile)
 		
-		print(FileDate[1].strftime("%Y-%m-%d %H:%M:%S") + "\t", end="")
+		print(FileDate[1].strftime("%Y-%m-%d %H:%M:%S") + "\t" + DATETYPE[FileDate[0]] , end="")
 		NewFolder = str(File.parent) + os.path.sep + FileDate[1].strftime("%Y-%m-%d")
 		if os.path.exists(NewFolder) == False:
 			os.mkdir(NewFolder)
 			shutil.move(File, NewFolder + os.path.sep + str(File.name))
-			print("OK")
+			print("(OK)")
 		elif os.path.isfile(NewFolder) == True:
 			print(FileDate[1].strftime("%Y-%m-%d") + " exists as a file. Not moving " + str(File.name))
 		else:
 			shutil.move(File, NewFolder + os.path.sep + str(File.name))
-			print("OK")
+			print("(OK)")
 input("Press any key to exit")
