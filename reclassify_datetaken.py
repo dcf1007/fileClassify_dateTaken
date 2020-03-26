@@ -26,6 +26,8 @@ def get_date(filename):
 
 for File in directory.iterdir():
 	if os.path.isfile(File):
+		print(str(File.name) + "\t--->\t", end="")
+		
 		FileDate = None
 		#Get all the files with the same stem
 		SameStemFiles = File.parent.glob(str(File.stem) + ".*")
@@ -42,7 +44,7 @@ for File in directory.iterdir():
 			else:
 				FileDate = get_date(SameStemFile)
 		
-		print(FileDate[1].strftime("%Y-%m-%d %H:%M:%S") + "\t" + str(File.name))
+		print(FileDate[1].strftime("%Y-%m-%d %H:%M:%S"))
 		NewFolder = str(File.parent) + os.path.sep + FileDate[1].strftime("%Y-%m-%d")
 		if os.path.exists(NewFolder) == False:
 			os.mkdir(NewFolder)
