@@ -1,2 +1,19 @@
 # fileClassify_dateTaken
- Python script created mainly for pictures that takes the files in a folder and classifies them in subfolders according to the EXIF date when the picture was taken. If there is no EXIF, it compares the file creation time and the modified time and if they match it uses that. If they don't match the user is prompt to choose which one
+
+Python script that takes the files directly inside a selected directory and copies them into date-based subdirectories according to supported EXIF date fields. If none of those EXIF fields is available, the filesystem modification time is used.
+
+The script does not scan subdirectories. Classified copies are written to `classified/YYYY-MM-DD`, while damaged files or files with unreliable image metadata are copied to `unclassified` for manual review. Original files are not moved or overwritten.
+
+## Requirements
+
+- Python 3.8 or newer
+- Phil Harvey's ExifTool 12.15 or newer, available as `exiftool` or `exiftool.exe` on the system `PATH`
+- PyExifTool 0.5.6
+
+Install the Python dependency with:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+PyExifTool is the Python wrapper imported by the script as `exiftool`. The separate ExifTool executable must also be installed; installing the Python package does not install that executable.
