@@ -12,13 +12,17 @@ DATETYPE = {0: "OS_DATE", 1: "METADATA"}
 # Read ExifTool's complete Time group instead of naming individual EXIF tags.
 # Time:All includes date/time tags from EXIF, XMP, IPTC, QuickTime, maker notes,
 # composite tags, and other metadata families supported by ExifTool.
+#
+# Normal classification deliberately does not request ExifTool's Validate,
+# Warning, or Error pseudo-tags. Validate performs additional conformance
+# checks and can generate warnings about non-standard tag locations even when
+# the timestamps themselves are fully readable. Those checks are independent
+# of timestamp discovery and therefore do not belong in this classification
+# pass.
 EXIFTOOL_TAGS = [
     "Time:All",
     "File:FileType",
     "File:MIMEType",
-    "ExifTool:Validate",
-    "ExifTool:Warning",
-    "ExifTool:Error",
 ]
 
 # -a retains duplicate tags instead of allowing ExifTool to suppress lower
@@ -89,8 +93,8 @@ def split_metadata_key(metadata_key):
 
     Family 0 identifies the metadata type, family 1 identifies the exact
     storage location, and family 4 gives duplicate instances unique JSON names.
-    This is the structural fix for a DateTimeOriginal stored in the wrong IFD:
-    the tag is retained with its real location instead of being discarded.
+    A DateTimeOriginal stored in IFD0 is therefore retained with its real
+    location instead of being hidden by another copy.
     """
     key_parts = metadata_key.split(":")
     return key_parts[:-1], key_parts[-1]
@@ -129,22 +133,6 @@ def get_first_metadata_value(metadata, tag_name):
     return values[0] if values else None
 
 
-def validation_reports_errors(validation_value):
-    """Return True when ExifTool Validate reports at least one error."""
-    if validation_value is None:
-        return False
-
-    validation_text = str(validation_value).strip().casefold()
-    if not validation_text:
-        return False
-
-    # Validate may be returned as human-readable text such as
-    # "1 Error, 3 Warnings". A zero-error value must not be treated as fatal.
-    return "error" in validation_text and not validation_text.startswith(
-        "0 error"
-    )
-
-
 def is_image_file(filename, metadata):
     """Return True when ExifTool or the filename identifies an image."""
     mime_type = get_first_metadata_value(metadata, "MIMEType")
@@ -170,14 +158,14 @@ def get_dates(metadata_reader, filename):
     maker notes, composites, and other supported groups become candidates for
     the existing numbered conflict prompt.
 
-    System filesystem timestamps are deliberately excluded from this candidate
-    pass. They remain the original fallback only when no complete embedded
-    timestamp exists.
+    Filesystem timestamps returned inside Time:All are excluded from the
+    metadata candidate pass. The filesystem modification time remains the
+    original fallback only when no complete embedded timestamp exists.
 
-    ExifTool warnings are displayed but do not automatically invalidate a file.
-    A structural warning such as DateTimeOriginal being stored in IFD0 describes
-    a non-standard location, not an unreadable timestamp. Actual ExifTool errors
-    still send known image files to unclassified.
+    The normal classification pass does not run ExifTool validation. Validation
+    checks metadata conformance and may warn about non-standard storage, such as
+    DateTimeOriginal being located in IFD0, even though the value is readable.
+    Timestamp extraction does not require those extra checks.
     """
     try:
         metadata_results = metadata_reader.get_tags(
@@ -204,59 +192,21 @@ def get_dates(metadata_reader, filename):
 
     metadata = metadata_results[0]
     file_is_image = is_image_file(filename, metadata)
-
-    error_messages = [
-        str(message).strip()
-        for message in get_metadata_values(metadata, "Error")
-        if str(message).strip()
-    ]
-    warning_messages = [
-        str(message).strip()
-        for message in get_metadata_values(metadata, "Warning")
-        if str(message).strip()
-    ]
-    validation_value = get_first_metadata_value(metadata, "Validate")
-
-    if file_is_image and (
-        error_messages or validation_reports_errors(validation_value)
-    ):
-        problem_messages = list(error_messages)
-        if validation_reports_errors(validation_value):
-            problem_messages.append(
-                f"validation result: {validation_value}"
-            )
-        return [], "ExifTool reported: " + "; ".join(problem_messages)
-
-    # Keep warnings visible without conflating metadata conformance warnings
-    # with extraction failure. This is especially important for RAW files that
-    # contain usable dates in a non-standard IFD.
-    for warning_message in warning_messages:
-        print(
-            f"Warning from ExifTool for '{filename.name}': "
-            f"{warning_message}",
-            file=sys.stderr,
-        )
-
     date_candidates = []
     invalid_date_messages = []
 
     for metadata_key, groups, tag_name, metadata_value in iter_metadata_values(
         metadata
     ):
-        # These tags support inspection but are not classification dates.
-        if tag_name in {
-            "FileType",
-            "MIMEType",
-            "Validate",
-            "Warning",
-            "Error",
-        }:
+        # These tags support file identification but are not dates.
+        if tag_name in {"FileType", "MIMEType"}:
             continue
 
-        # Time:All includes FileModifyDate, FileCreateDate, and FileAccessDate in
-        # the System family. Preserve the original behavior by using only the
-        # modification date as a fallback when embedded metadata is absent.
-        if groups and groups[0] == "System":
+        # With -G0:1:4, filesystem pseudo-tags are named File:System:... .
+        # The previous check looked only for System in the first group position,
+        # so FileModifyDate, FileCreateDate, and FileAccessDate leaked into the
+        # numbered choices. Match both group families explicitly instead.
+        if len(groups) >= 2 and groups[0:2] == ["File", "System"]:
             continue
 
         date_text = str(metadata_value).strip()
