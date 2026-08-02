@@ -68,7 +68,35 @@ The selected local time is evaluated with the IANA timezone database rather than
 
 The default timezone alone is an assumption and never proves that the camera clock was wrong. The script prompts only when available offset, UTC, or DST metadata contradicts the selected timezone. It shows the expected state, the conflicting evidence, and any defensible corrected time. The user may keep the recorded wall-clock time or apply a correction for classification.
 
-The original files and their metadata are never rewritten. A corrected classification value is reported as `METADATA_TIMEZONE_CORRECTED`.
+A corrected classification value is reported as `METADATA_TIMEZONE_CORRECTED`.
+
+### EXIF updates in corrected copies
+
+When the user accepts a timezone or daylight-saving correction, the script applies the same exact time shift to existing common EXIF timestamp fields in every classified image copy in that related group:
+
+```text
+DateTimeOriginal
+CreateDate
+ModifyDate
+```
+
+Each field is shifted from its own existing value. The script does not replace all three fields with one timestamp, so legitimate differences between capture, digitization, and modification times are preserved. Duplicate EXIF locations are handled independently. Missing EXIF date fields are not created, and separate subsecond fields remain unchanged.
+
+For every shifted timestamp type, the corresponding standard EXIF UTC-offset field is set to the corrected IANA-zone offset when that local time has one unambiguous offset:
+
+```text
+OffsetTimeOriginal
+OffsetTimeDigitized
+OffsetTime
+```
+
+The repeated autumn hour can have two valid UTC offsets. In that ambiguous case, the timestamp is shifted as selected, but the script does not guess an offset value.
+
+Metadata is written only to a temporary output copy. ExifTool then reads the temporary file back, and the script verifies every shifted EXIF timestamp and every intended offset before collision-safe placement in `classified`. If the metadata write or verification fails, the temporary file is removed and no partially corrected destination is retained. Binary-duplicate comparison uses the final corrected bytes, so a repeated run can recognize an already-corrected copy.
+
+Vendor-specific maker-note daylight-saving settings are not rewritten because their encodings and writability vary by manufacturer. GPS and UTC-reference fields are also left unchanged because they represent the absolute instant used to validate the correction. This write step is deliberately limited to EXIF: XMP, IPTC, QuickTime, and sidecar timestamps are not changed.
+
+Original source files and their metadata are never modified.
 
 ## Filesystem fallback
 
