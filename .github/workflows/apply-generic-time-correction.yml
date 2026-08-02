@@ -1,0 +1,287 @@
+name: Apply generic corrected-copy timestamp handling
+
+on:
+  push:
+    branches:
+      - agent/replace-pillow-pyexiftool
+    paths:
+      - .github/workflows/apply-generic-time-correction.yml
+      - .github/tmp/update_time_correction.part*
+
+permissions:
+  contents: write
+
+jobs:
+  apply-test-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/replace-pillow-pyexiftool
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Reconstruct and apply updater
+        shell: bash
+        run: |
+          cat .github/tmp/update_time_correction.part* | base64 --decode > /tmp/update_time_correction.py
+          python /tmp/update_time_correction.py
+          grep -q '^import os$' reclassify_datetaken.py
+          ! grep -q '^import tempfile$' reclassify_datetaken.py
+          grep -q '^def copy_file_with_corrected_metadata' reclassify_datetaken.py
+
+      - name: Install ExifTool and Python dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libimage-exiftool-perl
+          python -m pip install -r requirements.txt
+
+      - name: Compile and test correction planning
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        shell: bash
+        run: |
+          python -m py_compile reclassify_datetaken.py
+          python - <<'PY'
+          from datetime import datetime, timedelta
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          source_text = Path("reclassify_datetaken.py").read_text(encoding="utf-8")
+          definitions = source_text.split(
+              "# Request the source directory and intentionally process only regular files",
+              1,
+          )[0]
+          namespace = {}
+          exec(compile(definitions, "reclassify_datetaken.py", "exec"), namespace)
+
+          build = namespace["build_correction_operations"]
+          normalize = namespace["normalize_target"]
+          timezone = ZoneInfo("Europe/Berlin")
+          correction = timedelta(hours=1)
+          selected = datetime(2024, 9, 14, 1, 40, 47)
+
+          def planned(metadata):
+              operations, skipped = build(
+                  metadata,
+                  correction,
+                  selected,
+                  timezone,
+              )
+              return {
+                  normalize(operation["target"]): operation
+                  for operation in operations
+              }, skipped
+
+          operations, skipped = planned({
+              "EXIF:ExifIFD:DateTimeOriginal": "2024:09:14 00:40:47",
+          })
+          assert operations["ExifIFD:DateTimeOriginal"]["value"] == "2024:09:14 01:40:47"
+          assert not skipped
+
+          operations, _ = planned({
+              "XMP:XMP-xmp:CreateDate": "2024-09-14T00:40:47+01:00",
+          })
+          assert operations["XMP-xmp:CreateDate"]["value"] == "2024-09-14T00:40:47+02:00"
+
+          operations, _ = planned({
+              "EXIF:ExifIFD:DateTimeOriginal": "2024:09:14 00:40:47",
+              "EXIF:ExifIFD:OffsetTimeOriginal": "+01:00",
+          })
+          assert "ExifIFD:DateTimeOriginal" not in operations
+          assert operations["ExifIFD:OffsetTimeOriginal"]["value"] == "+02:00"
+
+          operations, _ = planned({
+              "MakerNotes:Canon:DaylightSavings": 0,
+          })
+          assert operations["Canon:DaylightSavings"]["value"] == "60"
+
+          operations, _ = planned({
+              "MakerNotes:Pentax:WorldTimeLocation": 1,
+              "MakerNotes:Pentax:HometownDST": 0,
+              "MakerNotes:Pentax:DestinationDST": 0,
+          })
+          assert "Pentax:HometownDST" not in operations
+          assert operations["Pentax:DestinationDST"]["value"] == "1"
+
+          operations, _ = planned({
+              "MakerNotes:Olympus:DateTimeUTC": "2024:09:13 22:40:47",
+          })
+          assert not operations
+
+          operations, _ = planned({
+              "IPTC:IPTC:DateCreated": "2024:09:14",
+              "IPTC:IPTC:TimeCreated": "23:40:47",
+          })
+          assert operations["IPTC:DateCreated"]["value"] == "2024:09:15"
+          assert operations["IPTC:TimeCreated"]["value"] == "00:40:47"
+
+          class FakeReader:
+              def get_tags(self, files, tags, params):
+                  return [{"File:System:FileModifyDate": "2024:09:14 00:40:47+01:00"}]
+
+          fallback, error = namespace["get_file_modify_date"](
+              FakeReader(),
+              Path("sample.jpg"),
+          )
+          assert error is None
+          assert fallback[1] == datetime(2024, 9, 14, 0, 40, 47)
+          assert fallback[3] == 60
+          print("correction planning tests passed")
+          PY
+
+      - name: Exercise a real corrected classified copy
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        shell: bash
+        run: |
+          python - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          import subprocess
+          import tempfile
+          from datetime import datetime, timedelta
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          source_text = Path("reclassify_datetaken.py").read_text(encoding="utf-8")
+          definitions = source_text.split(
+              "# Request the source directory and intentionally process only regular files",
+              1,
+          )[0]
+          namespace = {}
+          exec(compile(definitions, "reclassify_datetaken.py", "exec"), namespace)
+
+          jpeg_bytes = base64.b64decode(
+              "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oADAMBAAIAAwAAABD/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAEDAQE/EH//xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAECAQE/EH//xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAE/EH//2Q=="
+          )
+
+          with tempfile.TemporaryDirectory() as temp_name:
+              root = Path(temp_name)
+              source_file = root / "source.jpg"
+              output_directory = root / "classified" / "2024-09-14"
+              output_directory.mkdir(parents=True)
+              requested_destination = output_directory / source_file.name
+              source_file.write_bytes(jpeg_bytes)
+
+              subprocess.run(
+                  [
+                      "exiftool",
+                      "-overwrite_original",
+                      "-EXIF:DateTimeOriginal=2024:09:14 00:40:47",
+                      "-EXIF:CreateDate=2024:09:14 00:40:49",
+                      "-EXIF:OffsetTimeDigitized=+01:00",
+                      "-XMP-xmp:CreateDate=2024-09-14T00:40:47+01:00",
+                      "-IPTC:DateCreated=2024:09:14",
+                      "-IPTC:TimeCreated=23:40:47",
+                      str(source_file),
+                  ],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              )
+              baseline_ns = 1_726_272_047_000_000_000
+              os.utime(source_file, ns=(baseline_ns, baseline_ns))
+              source_hash = hashlib.sha256(source_file.read_bytes()).hexdigest()
+
+              helper = namespace["ExifToolHelper"](common_args=["-G0:1:4"])
+              helper.run()
+              try:
+                  (
+                      destination_file,
+                      copied,
+                      renamed,
+                      updated,
+                      skipped,
+                      already_corrected,
+                  ) = namespace["copy_file_with_corrected_metadata"](
+                      helper,
+                      source_file,
+                      requested_destination,
+                      timedelta(hours=1),
+                      datetime(2024, 9, 14, 1, 40, 47),
+                      ZoneInfo("Europe/Berlin"),
+                  )
+              finally:
+                  helper.terminate()
+
+              assert copied and not renamed and not already_corrected
+              assert destination_file == requested_destination
+              assert destination_file.is_file()
+              assert not list(output_directory.glob(".reclassify_*"))
+              assert hashlib.sha256(source_file.read_bytes()).hexdigest() == source_hash
+              assert source_file.stat().st_mtime_ns == baseline_ns
+              assert destination_file.stat().st_mtime_ns == baseline_ns + 3_600_000_000_000
+              assert "FileModifyDate" in updated
+
+              read_args = [
+                  "exiftool", "-j", "-G0:1",
+                  "-DateTimeOriginal", "-CreateDate",
+                  "-OffsetTimeDigitized", "-XMP:CreateDate",
+                  "-IPTC:DateCreated", "-IPTC:TimeCreated",
+              ]
+              source_metadata = json.loads(
+                  subprocess.run(
+                      [*read_args, str(source_file)],
+                      check=True,
+                      capture_output=True,
+                      text=True,
+                  ).stdout
+              )[0]
+              metadata = json.loads(
+                  subprocess.run(
+                      [*read_args, str(destination_file)],
+                      check=True,
+                      capture_output=True,
+                      text=True,
+                  ).stdout
+              )[0]
+              parse_complete = namespace["parse_complete_metadata_datetime"]
+              assert parse_complete(metadata["EXIF:ExifIFD:DateTimeOriginal"]) == (
+                  datetime(2024, 9, 14, 1, 40, 47),
+                  None,
+              )
+              assert parse_complete(metadata["EXIF:ExifIFD:CreateDate"])[0] == datetime(
+                  2024, 9, 14, 0, 40, 49
+              )
+              assert namespace["parse_context_offset"](
+                  "OffsetTimeDigitized",
+                  metadata["EXIF:ExifIFD:OffsetTimeDigitized"],
+              ) == 120
+              assert parse_complete(metadata["XMP:XMP-xmp:CreateDate"]) == (
+                  datetime(2024, 9, 14, 0, 40, 47),
+                  120,
+              )
+              parse_partial = namespace["parse_partial_datetime"]
+              source_pair = parse_partial(
+                  source_metadata["IPTC:IPTC:DateCreated"],
+                  source_metadata["IPTC:IPTC:TimeCreated"],
+              )
+              destination_pair = parse_partial(
+                  metadata["IPTC:IPTC:DateCreated"],
+                  metadata["IPTC:IPTC:TimeCreated"],
+              )
+              if source_pair[1] is None:
+                  assert destination_pair == (source_pair[0] + timedelta(hours=1), None)
+              else:
+                  assert destination_pair == (source_pair[0], 120)
+              print("real ExifTool corrected-copy test passed")
+              if skipped:
+                  print("read-only/unsupported fields skipped:", skipped)
+          PY
+
+      - name: Commit final implementation and remove one-shot files
+        shell: bash
+        run: |
+          rm -f .github/tmp/update_time_correction.part*
+          rm -f .github/workflows/apply-generic-time-correction.yml
+          rm -rf __pycache__
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Correct all local timestamps in classified copies"
+          git push origin HEAD:agent/replace-pillow-pyexiftool
