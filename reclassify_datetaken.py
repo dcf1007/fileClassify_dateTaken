@@ -70,6 +70,8 @@ EXCLUDED_TIME_TAGS = (
     "EndTime",
     "ProfileDateTime",
     "LayerModifyDates",
+    "ExtensionCreateDate",
+    "ExtensionModifyDate",
 )
 
 EXIFTOOL_READ_PARAMS = [
