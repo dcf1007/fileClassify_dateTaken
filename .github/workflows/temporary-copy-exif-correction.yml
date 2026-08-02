@@ -1,0 +1,575 @@
+name: Temporary EXIF correction patch
+
+on:
+  push:
+    branches:
+      - agent/replace-pillow-pyexiftool
+    paths:
+      - .github/workflows/temporary-copy-exif-correction.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply-patch:
+    if: github.event.head_commit.message == 'Install temporary EXIF correction patch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/replace-pillow-pyexiftool
+
+      - name: Patch script and README
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(text, old, new, label):
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f"{label}: expected one match, found {count}")
+              return text.replace(old, new, 1)
+
+          script_path = Path("reclassify_datetaken.py")
+          script = script_path.read_text(encoding="utf-8")
+
+          script = replace_once(
+              script,
+              "import re\nimport shutil\nimport sys\n",
+              "import os\nimport re\nimport shutil\nimport sys\nimport tempfile\n",
+              "imports",
+          )
+
+          script = replace_once(
+              script,
+              'EXIF_DATE_FORMAT = "%Y:%m:%d %H:%M:%S"\n\n',
+              '''EXIF_DATE_FORMAT = "%Y:%m:%d %H:%M:%S"\n\n# When a timezone correction is accepted, these common writable EXIF\n# timestamps are shifted on the output copy by the same exact timedelta.\n# Existing differences between original, digitized, and modified times are\n# preserved rather than replacing every field with one selected value.\nEXIF_TIMESTAMP_TAGS_TO_SHIFT = {\n    "DateTimeOriginal",\n    "CreateDate",\n    "ModifyDate",\n}\nEXIF_OFFSET_TAG_BY_TIMESTAMP = {\n    "DateTimeOriginal": "OffsetTimeOriginal",\n    "CreateDate": "OffsetTimeDigitized",\n    "ModifyDate": "OffsetTime",\n}\nEXIF_CORRECTION_READ_TAGS = [\n    "EXIF:DateTimeOriginal",\n    "EXIF:CreateDate",\n    "EXIF:ModifyDate",\n    "EXIF:OffsetTimeOriginal",\n    "EXIF:OffsetTimeDigitized",\n    "EXIF:OffsetTime",\n]\n\n''',
+              "EXIF correction constants",
+          )
+
+          helper_block = r'''
+
+def format_exif_offset(offset_minutes):
+    """Format an offset in minutes using the EXIF +HH:MM representation."""
+    sign = "+" if offset_minutes >= 0 else "-"
+    absolute_minutes = abs(offset_minutes)
+    hours, minutes = divmod(absolute_minutes, 60)
+    return f"{sign}{hours:02d}:{minutes:02d}"
+
+
+def get_exif_write_target(groups, tag_name):
+    """Return a family-1 EXIF write target for a grouped extraction key."""
+    if not groups or groups[0] != "EXIF":
+        return None
+
+    # With -G0:1:4, the second component is the writable EXIF IFD and the
+    # optional third component is an instance label such as Copy1. Instance
+    # labels are extraction-only and must not be used in a write argument.
+    if len(groups) >= 2 and not groups[1].casefold().startswith("copy"):
+        return f"{groups[1]}:{tag_name}"
+    return f"EXIF:{tag_name}"
+
+
+def read_exif_correction_state(metadata_reader, filename):
+    """Read writable EXIF timestamps and standard UTC-offset fields."""
+    try:
+        metadata_results = metadata_reader.get_tags(
+            files=filename,
+            tags=EXIF_CORRECTION_READ_TAGS,
+            params=["-a"],
+        )
+    except ExifToolException as error:
+        raise OSError(
+            f"ExifTool could not read EXIF correction fields from "
+            f"'{filename}': {error}"
+        ) from error
+
+    if not metadata_results:
+        return {}, {}
+
+    timestamps_by_target = {}
+    offsets_by_tag = {}
+    for metadata_key, groups, tag_name, metadata_value in iter_metadata_values(
+        metadata_results[0]
+    ):
+        if not groups or groups[0] != "EXIF":
+            continue
+
+        if tag_name in EXIF_TIMESTAMP_TAGS_TO_SHIFT:
+            try:
+                parsed_date = parse_complete_metadata_datetime(metadata_value)
+            except ValueError as error:
+                raise OSError(
+                    f"cannot shift invalid EXIF timestamp "
+                    f"{metadata_key}={metadata_value!r}: {error}"
+                ) from error
+            if parsed_date is None:
+                raise OSError(
+                    f"cannot shift incomplete EXIF timestamp "
+                    f"{metadata_key}={metadata_value!r}"
+                )
+
+            write_target = get_exif_write_target(groups, tag_name)
+            target_values = timestamps_by_target.setdefault(write_target, [])
+            date_value = parsed_date[0]
+            if date_value not in target_values:
+                target_values.append(date_value)
+            continue
+
+        if tag_name in EXIF_OFFSET_TAG_BY_TIMESTAMP.values():
+            offset_minutes = parse_context_offset(tag_name, metadata_value)
+            if offset_minutes is not None:
+                tag_offsets = offsets_by_tag.setdefault(tag_name, [])
+                if offset_minutes not in tag_offsets:
+                    tag_offsets.append(offset_minutes)
+
+    return timestamps_by_target, offsets_by_tag
+
+
+def shift_exif_timestamps_in_copy(
+    metadata_reader,
+    filename,
+    correction_delta,
+    target_offset_minutes,
+):
+    """
+    Shift existing common EXIF timestamps and verify the output copy.
+
+    Only the copy is passed here. Maker-note DST flags are intentionally not
+    written because their encodings and writability vary by manufacturer. The
+    standard EXIF OffsetTime fields are used to record the corrected zone.
+    """
+    timestamps_before, _ = read_exif_correction_state(
+        metadata_reader,
+        filename,
+    )
+    if not timestamps_before:
+        return False
+
+    correction_seconds = int(correction_delta.total_seconds())
+    if correction_seconds == 0:
+        return False
+
+    shift_operator = "+=" if correction_seconds > 0 else "-="
+    shift_value = f"0:0:{abs(correction_seconds)}"
+    write_arguments = [
+        "-overwrite_original_in_place",
+        "-P",
+    ]
+    for write_target in sorted(timestamps_before):
+        write_arguments.append(
+            f"-{write_target}{shift_operator}{shift_value}"
+        )
+
+    expected_offset_tags = set()
+    if target_offset_minutes is not None:
+        offset_text = format_exif_offset(target_offset_minutes)
+        timestamp_tag_names = {
+            write_target.rsplit(":", 1)[-1]
+            for write_target in timestamps_before
+        }
+        for timestamp_tag_name in timestamp_tag_names:
+            offset_tag_name = EXIF_OFFSET_TAG_BY_TIMESTAMP[
+                timestamp_tag_name
+            ]
+            expected_offset_tags.add(offset_tag_name)
+            # OffsetTime tags have a standard home in ExifIFD. Creating these
+            # explicit tags is intentional and avoids manufacturer-specific
+            # maker-note writes.
+            write_arguments.append(
+                f"-ExifIFD:{offset_tag_name}={offset_text}"
+            )
+
+    write_arguments.append(str(filename))
+    try:
+        metadata_reader.execute(*write_arguments)
+    except ExifToolException as error:
+        raise OSError(
+            f"ExifTool could not update corrected EXIF timestamps in "
+            f"'{filename}': {error}"
+        ) from error
+
+    timestamps_after, offsets_after = read_exif_correction_state(
+        metadata_reader,
+        filename,
+    )
+    for write_target, old_values in timestamps_before.items():
+        expected_values = sorted(
+            old_value + correction_delta for old_value in old_values
+        )
+        actual_values = sorted(timestamps_after.get(write_target, []))
+        if actual_values != expected_values:
+            raise OSError(
+                f"EXIF verification failed for {write_target} in "
+                f"'{filename}': expected {expected_values}, got "
+                f"{actual_values}"
+            )
+
+    if target_offset_minutes is not None:
+        for offset_tag_name in expected_offset_tags:
+            if target_offset_minutes not in offsets_after.get(
+                offset_tag_name,
+                [],
+            ):
+                raise OSError(
+                    f"EXIF verification failed for {offset_tag_name} in "
+                    f"'{filename}': expected "
+                    f"{format_exif_offset(target_offset_minutes)}"
+                )
+
+    return True
+
+'''
+          script = replace_once(
+              script,
+              "\ndef format_records_by_file(records):\n",
+              helper_block + "\ndef format_records_by_file(records):\n",
+              "EXIF correction helpers",
+          )
+
+          corrected_copy_block = r'''
+
+def copy_file_with_exif_correction(
+    metadata_reader,
+    source_file,
+    requested_destination,
+    correction_delta,
+    target_offset_minutes,
+):
+    """
+    Build and verify a corrected temporary copy before collision handling.
+
+    Comparing the final corrected bytes preserves the existing duplicate and
+    collision behavior across repeated runs. A failed metadata write never
+    leaves a partially corrected file at the requested destination.
+    """
+    temporary_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{source_file.name}.",
+        suffix=".timezone-correction.tmp",
+        dir=requested_destination.parent,
+    )
+    os.close(temporary_descriptor)
+    temporary_file = Path(temporary_name)
+
+    try:
+        with source_file.open("rb") as source_stream:
+            with temporary_file.open("wb") as temporary_stream:
+                shutil.copyfileobj(
+                    source_stream,
+                    temporary_stream,
+                    length=COPY_CHUNK_SIZE,
+                )
+        shutil.copystat(source_file, temporary_file)
+
+        exif_timestamps_present = shift_exif_timestamps_in_copy(
+            metadata_reader,
+            temporary_file,
+            correction_delta,
+            target_offset_minutes,
+        )
+        destination_file, copied, renamed = copy_file_safely(
+            temporary_file,
+            requested_destination,
+        )
+        return (
+            destination_file,
+            copied,
+            renamed,
+            exif_timestamps_present,
+        )
+    finally:
+        try:
+            temporary_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+'''
+          script = replace_once(
+              script,
+              "\n\n# Request the source directory and intentionally process only regular files\n",
+              corrected_copy_block
+              + "\n# Request the source directory and intentionally process only regular files\n",
+              "corrected copy helper",
+          )
+
+          script = replace_once(
+              script,
+              "renamed_count = 0\nreview_count = 0\nfailed_count = 0\n",
+              "renamed_count = 0\nmetadata_updated_count = 0\nreview_count = 0\nfailed_count = 0\n",
+              "metadata counter",
+          )
+
+          script = replace_once(
+              script,
+              "        selected_file_date = None\n        selected_date_option = None\n",
+              "        selected_file_date = None\n        selected_date_option = None\n        timezone_correction_delta = None\n        target_offset_minutes = None\n",
+              "group correction state",
+          )
+
+          old_review = '''        if (
+            selected_file_date is not None
+            and selected_file_date[0] == 1
+            and selected_date_option is not None
+        ):
+            selected_file_date = review_timezone_evidence(
+                selected_file_date,
+                selected_date_option,
+                base_capture_files,
+                context_records_by_file,
+                utc_records_by_file,
+                timezone_name,
+                classification_timezone,
+            )
+'''
+          new_review = '''        if (
+            selected_file_date is not None
+            and selected_file_date[0] == 1
+            and selected_date_option is not None
+        ):
+            uncorrected_file_date = selected_file_date
+            selected_file_date = review_timezone_evidence(
+                selected_file_date,
+                selected_date_option,
+                base_capture_files,
+                context_records_by_file,
+                utc_records_by_file,
+                timezone_name,
+                classification_timezone,
+            )
+            if selected_file_date[0] == 2:
+                timezone_correction_delta = (
+                    selected_file_date[1] - uncorrected_file_date[1]
+                )
+                corrected_states = timezone_states_for_local_time(
+                    selected_file_date[1],
+                    classification_timezone,
+                )
+                if len(corrected_states) == 1:
+                    target_offset_minutes = corrected_states[0][1]
+'''
+          script = replace_once(
+              script,
+              old_review,
+              new_review,
+              "timezone review result",
+          )
+
+          old_copy = '''            try:
+                destination_directory.mkdir(parents=True, exist_ok=True)
+                destination_file, copied, renamed = copy_file_safely(
+                    same_stem_file,
+                    destination_directory / same_stem_file.name,
+                )
+            except OSError as error:
+                print(
+                    f"Error copying '{same_stem_file.name}': {error}",
+                    file=sys.stderr,
+                )
+                failed_count += 1
+                continue
+'''
+          new_copy = '''            exif_timestamps_present = False
+            try:
+                destination_directory.mkdir(parents=True, exist_ok=True)
+                requested_destination = (
+                    destination_directory / same_stem_file.name
+                )
+                if (
+                    timezone_correction_delta is not None
+                    and same_stem_file not in review_reasons
+                ):
+                    (
+                        destination_file,
+                        copied,
+                        renamed,
+                        exif_timestamps_present,
+                    ) = copy_file_with_exif_correction(
+                        metadata_reader,
+                        same_stem_file,
+                        requested_destination,
+                        timezone_correction_delta,
+                        target_offset_minutes,
+                    )
+                else:
+                    destination_file, copied, renamed = copy_file_safely(
+                        same_stem_file,
+                        requested_destination,
+                    )
+            except OSError as error:
+                print(
+                    f"Error copying or updating '{same_stem_file.name}': "
+                    f"{error}",
+                    file=sys.stderr,
+                )
+                failed_count += 1
+                continue
+'''
+          script = replace_once(
+              script,
+              old_copy,
+              new_copy,
+              "copy call",
+          )
+
+          script = replace_once(
+              script,
+              '''            if same_stem_file in review_reasons:
+                review_count += 1
+''',
+              '''            if exif_timestamps_present:
+                if copied:
+                    metadata_updated_count += 1
+                    print("; EXIF TIMESTAMPS UPDATED", end="")
+                else:
+                    print("; EXIF TIMESTAMPS ALREADY CORRECTED", end="")
+
+            if same_stem_file in review_reasons:
+                review_count += 1
+''',
+              "copy status",
+          )
+
+          script = replace_once(
+              script,
+              'print(f"Renamed collision copies: {renamed_count}")\n',
+              'print(f"Renamed collision copies: {renamed_count}")\n'
+              'print(f"Copies with corrected EXIF timestamps: "\n'
+              '      f"{metadata_updated_count}")\n',
+              "summary counter",
+          )
+
+          script_path.write_text(script, encoding="utf-8")
+
+          readme_path = Path("README.md")
+          readme = readme_path.read_text(encoding="utf-8")
+          readme = replace_once(
+              readme,
+              "The original files and their metadata are never rewritten. A corrected classification value is reported as `METADATA_TIMEZONE_CORRECTED`.\n",
+              '''The original source files and their metadata are never rewritten. A corrected classification value is reported as `METADATA_TIMEZONE_CORRECTED`.\n\nWhen the user accepts a timezone/daylight-saving correction, the script also corrects metadata in each applicable output copy. It first creates a temporary copy, shifts every existing common EXIF timestamp (`DateTimeOriginal`, `CreateDate`, and `ModifyDate`) by the exact selected correction, and sets the corresponding standard EXIF offset fields (`OffsetTimeOriginal`, `OffsetTimeDigitized`, and `OffsetTime`) to the selected IANA timezone's offset when that offset is unambiguous. Shifting rather than replacing the fields preserves legitimate differences between original, digitized, and modification timestamps. Separate subsecond fields remain intact.\n\nThe EXIF write is performed with ExifTool on the temporary copy, preserving its filesystem modification time. The script reads the result back and verifies every shifted timestamp and intended offset before the copy enters the classified directory. If writing or verification fails, the temporary file is removed, no partially corrected destination is retained, and the file is counted as failed. Collision and binary-duplicate checks operate on the final corrected bytes, so a repeated run can recognize an already-corrected copy.\n\nVendor maker-note daylight-saving flags are not rewritten: their numeric encodings and writability differ by manufacturer. GPS/UTC reference fields are also left unchanged because they represent the absolute instant used to validate the local correction. XMP, IPTC, QuickTime, and sidecar timestamps are not changed by this EXIF-only write step.\n''',
+              "README correction behavior",
+          )
+          readme_path.write_text(readme, encoding="utf-8")
+          PY
+
+      - name: Install test dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libimage-exiftool-perl
+          python -m pip install -r requirements.txt
+
+      - name: Compile and test corrected-copy EXIF writes
+        shell: bash
+        run: |
+          python -m py_compile reclassify_datetaken.py
+          python - <<'PY'
+          import base64
+          import subprocess
+          import tempfile
+          from datetime import timedelta
+          from pathlib import Path
+
+          source = Path("reclassify_datetaken.py").read_text(encoding="utf-8")
+          definitions = source.split(
+              "# Request the source directory and intentionally process only regular files",
+              1,
+          )[0]
+          namespace = {}
+          exec(compile(definitions, "reclassify_datetaken.py", "exec"), namespace)
+
+          # Minimal valid JPEG; ExifTool creates the EXIF block used by the test.
+          jpeg_data = base64.b64decode(
+              "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oADAMBAAIAAwAAABD/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAEDAQE/EH//xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAECAQE/EH//xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAE/EH//2Q=="
+          )
+
+          with tempfile.TemporaryDirectory() as temp_directory:
+              temp_directory = Path(temp_directory)
+              source_file = temp_directory / "source.jpg"
+              destination_file = temp_directory / "out" / "source.jpg"
+              destination_file.parent.mkdir()
+              source_file.write_bytes(jpeg_data)
+
+              subprocess.run(
+                  [
+                      "exiftool",
+                      "-overwrite_original",
+                      "-DateTimeOriginal=2024:09:14 00:40:47",
+                      "-CreateDate=2024:09:14 00:40:49",
+                      "-ModifyDate=2024:09:14 00:41:00",
+                      "-OffsetTimeOriginal=+01:00",
+                      "-OffsetTimeDigitized=+01:00",
+                      "-OffsetTime=+01:00",
+                      str(source_file),
+                  ],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              )
+
+              helper_class = namespace["ExifToolHelper"]
+              with helper_class(common_args=["-G0:1:4"]) as metadata_reader:
+                  result = namespace["copy_file_with_exif_correction"](
+                      metadata_reader,
+                      source_file,
+                      destination_file,
+                      timedelta(hours=1),
+                      120,
+                  )
+                  assert result[1] is True
+                  assert result[3] is True
+
+                  timestamps, offsets = namespace[
+                      "read_exif_correction_state"
+                  ](metadata_reader, result[0])
+
+              flattened = {
+                  target.rsplit(":", 1)[-1]: values
+                  for target, values in timestamps.items()
+              }
+              assert flattened["DateTimeOriginal"][0].hour == 1
+              assert flattened["DateTimeOriginal"][0].minute == 40
+              assert flattened["CreateDate"][0].second == 49
+              assert flattened["ModifyDate"][0].minute == 41
+              for offset_tag in (
+                  "OffsetTimeOriginal",
+                  "OffsetTimeDigitized",
+                  "OffsetTime",
+              ):
+                  assert offsets[offset_tag] == [120]
+
+              # The source remains unchanged.
+              source_output = subprocess.run(
+                  [
+                      "exiftool",
+                      "-s3",
+                      "-DateTimeOriginal",
+                      str(source_file),
+                  ],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              ).stdout.strip()
+              assert source_output == "2024:09:14 00:40:47"
+
+              # A repeated corrected copy is recognized as a binary duplicate.
+              with helper_class(common_args=["-G0:1:4"]) as metadata_reader:
+                  repeated = namespace["copy_file_with_exif_correction"](
+                      metadata_reader,
+                      source_file,
+                      destination_file,
+                      timedelta(hours=1),
+                      120,
+                  )
+              assert repeated[1] is False
+              assert repeated[0] == destination_file
+          PY
+
+      - name: Commit patched implementation
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add reclassify_datetaken.py README.md
+          git commit -m "Update EXIF fields in corrected copies"
+          git push origin HEAD:agent/replace-pillow-pyexiftool
