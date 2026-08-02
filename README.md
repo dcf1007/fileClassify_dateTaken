@@ -14,13 +14,25 @@ The first pass uses PyExifTool to request ExifTool's complete `Time:All` group w
 
 The request excludes the family-1 `System` group before ExifTool returns results, so filesystem pseudo-tags such as `FileModifyDate`, `FileCreateDate`, `FileAccessDate`, and `FileInodeChangeDate` do not enter the embedded-metadata choices.
 
-It also excludes these non-creation timestamps:
+It also excludes timestamps whose semantics do not describe original image or recording creation:
 
 ```text
 PowerUpTime
-XMP-xmp:MetadataDate
-XMP-xmpMM:HistoryWhen
+TimeSincePowerOn
+RunTimeSincePowerUp
+ShotNumberSincePowerUp
+MetadataDate
+HistoryWhen
+ModifyDate
+SubSecModifyDate
+MediaModifyDate
+TrackModifyDate
+LastModifyDate
+DateTimeEnd
+EndTime
 ```
+
+These cover camera/device operation, metadata history, resource modification, and recording-end events. Capture-oriented maker-note fields such as `SonyDateTime`, `SonyDateTime2`, `PanasonicDateTime`, and Olympus `DateTimeUTC` remain eligible.
 
 The remaining timestamps may come from EXIF, XMP, IPTC, QuickTime, maker notes, composite tags, and other metadata families supported by ExifTool. `-G0:1:4` preserves the metadata type, exact storage location, and duplicate instance number.
 
