@@ -1,0 +1,36 @@
+name: Apply EXIF copy correction
+
+on:
+  push:
+    branches:
+      - agent/replace-pillow-pyexiftool
+    paths:
+      - apply-exif-copy-correction.patch
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/replace-pillow-pyexiftool
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Apply validated patch
+        run: |
+          git apply --check apply-exif-copy-correction.patch
+          git apply apply-exif-copy-correction.patch
+          rm apply-exif-copy-correction.patch
+          rm .github/workflows/apply-exif-copy-correction.yml
+
+      - name: Commit corrected-copy EXIF support
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Rewrite EXIF timestamps in corrected copies"
+          git push origin HEAD:agent/replace-pillow-pyexiftool
