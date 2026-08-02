@@ -1,14 +1,21 @@
 import re
 import shutil
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from exiftool import ExifToolHelper
 from exiftool.exceptions import ExifToolException, ExifToolExecuteError
 
 
-DATETYPE = {0: "OS_DATE", 1: "METADATA"}
+DATETYPE = {
+    0: "OS_DATE",
+    1: "METADATA",
+    2: "METADATA_DST_CORRECTED",
+}
+
+DEFAULT_TIMEZONE_NAME = "Europe/Berlin"
 
 # Read ExifTool's complete Time group instead of naming individual EXIF tags.
 # Time:All includes date/time tags from EXIF, XMP, IPTC, QuickTime, maker notes,
@@ -24,6 +31,15 @@ EXIFTOOL_TAGS = [
     "Time:All",
     "File:FileType",
     "File:MIMEType",
+    # Raw maker-note value: Nikon stores 0/1, Canon stores 0/60.
+    "DaylightSavings#",
+    # Timezone context is not a classification date, but helps explain and
+    # corroborate a daylight-saving mismatch.
+    "TimeZone",
+    "TimeZoneCity",
+    "OffsetTimeOriginal",
+    "OffsetTimeDigitized",
+    "TimeZoneOffset",
 ]
 
 # Refine the Time:All request inside ExifTool instead of extracting everything
@@ -77,6 +93,19 @@ FILE_MODIFY_DATE_PARAMS = [
 ]
 
 EXIF_DATE_FORMAT = "%Y:%m:%d %H:%M:%S"
+TIME_CONTEXT_TAGS = {
+    "DaylightSavings",
+    "TimeZone",
+    "TimeZoneCity",
+    "OffsetTimeOriginal",
+    "OffsetTimeDigitized",
+    "TimeZoneOffset",
+}
+TIMESTAMP_OFFSET_TAGS = {
+    "OffsetTimeOriginal",
+    "OffsetTimeDigitized",
+    "TimeZoneOffset",
+}
 COMPLETE_DATE_TIME_PATTERN = re.compile(
     r"^(?P<year>\d{4})[:-](?P<month>\d{2})[:-](?P<day>\d{2})[ T]"
     r"(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})"
@@ -189,39 +218,75 @@ def is_image_file(filename, metadata):
     return filename.suffix.casefold() in IMAGE_EXTENSIONS
 
 
+def parse_timezone_offset_minutes(timezone_text):
+    """Return a numeric UTC offset in minutes, or None when absent."""
+    if not timezone_text:
+        return None
+    if timezone_text == "Z":
+        return 0
+
+    sign = 1 if timezone_text[0] == "+" else -1
+    timezone_hour = int(timezone_text[1:3])
+    timezone_minute = int(timezone_text[-2:])
+    if timezone_hour > 23 or timezone_minute > 59:
+        raise ValueError(f"invalid timezone offset {timezone_text!r}")
+
+    return sign * (timezone_hour * 60 + timezone_minute)
+
+
+def parse_metadata_offset_value(metadata_value):
+    """Parse a standalone ExifTool timezone-offset value when possible."""
+    if isinstance(metadata_value, (int, float)):
+        numeric_value = float(metadata_value)
+        # EXIF TimeZoneOffset is expressed in hours. Some maker-note TimeZone
+        # fields use minutes, but those are context only and are not passed here.
+        if -24 <= numeric_value <= 24:
+            return int(numeric_value * 60)
+        return None
+
+    value_text = str(metadata_value).strip()
+    offset_match = re.search(
+        r"(?P<sign>[+-])(?P<hour>\d{2}):?(?P<minute>\d{2})",
+        value_text,
+    )
+    if offset_match is None:
+        return None
+
+    timezone_text = (
+        offset_match.group("sign")
+        + offset_match.group("hour")
+        + ":"
+        + offset_match.group("minute")
+    )
+    return parse_timezone_offset_minutes(timezone_text)
+
+
 def parse_complete_metadata_datetime(metadata_value):
     """
-    Parse one complete ExifTool date/time into the classifier's canonical form.
+    Parse one complete ExifTool date/time into canonical classification data.
 
-    The embedded metadata pass keeps ExifTool's raw values so date-only and
-    time-only fields can be rejected without inventing missing components. A
-    complete timestamp may include fractional seconds and a timezone suffix.
+    Raw values are retained until this boundary so partial date-only and
+    time-only fields can be rejected. Complete timestamps are canonicalized to
+    one-second wall-clock precision, while an explicit UTC offset is returned
+    separately as supporting timezone evidence.
 
-    Classification comparisons intentionally use one-second resolution. EXIF
-    often stores whole seconds while XMP and ExifTool Composite fields retain
-    fractions for the same capture event. Constructing the result directly from
-    year through second gives every caller the same canonical representation at
-    the parser boundary, before candidates are grouped or displayed.
-
-    Timezone suffixes are syntax-checked but retain the existing wall-clock
-    behavior: they are not converted to another timezone.
+    Return (local_datetime, utc_offset_minutes), or None for a partial/non-date
+    value. An explicit offset is not applied to the wall-clock value because the
+    classifier organizes files by the photographer's local calendar date.
     """
     date_text = str(metadata_value).strip()
     date_match = COMPLETE_DATE_TIME_PATTERN.fullmatch(date_text)
     if date_match is None:
         return None
 
-    timezone_text = date_match.group("timezone")
-    if timezone_text and timezone_text != "Z":
-        timezone_hour = int(timezone_text[1:3])
-        timezone_minute = int(timezone_text[-2:])
-        if timezone_hour > 23 or timezone_minute > 59:
-            raise ValueError(f"invalid timezone offset {timezone_text!r}")
+    timezone_offset_minutes = parse_timezone_offset_minutes(
+        date_match.group("timezone")
+    )
 
-    # Deliberately construct only through whole seconds. The optional fractional
-    # component was validated by the pattern but is not part of classification
-    # identity, matching the precision shown in prompts and final summaries.
-    return datetime(
+    # Construct only through whole seconds. Fractional precision may differ
+    # between EXIF and XMP representations of the same exposure, but it does not
+    # change the classifier's second-resolution identity.
+    local_datetime = datetime(
         int(date_match.group("year")),
         int(date_match.group("month")),
         int(date_match.group("day")),
@@ -229,11 +294,290 @@ def parse_complete_metadata_datetime(metadata_value):
         int(date_match.group("minute")),
         int(date_match.group("second")),
     )
+    return local_datetime, timezone_offset_minutes
+
+
+def parse_daylight_savings_value(metadata_value):
+    """Normalize maker-note daylight-saving values to True, False, or None."""
+    if isinstance(metadata_value, bool):
+        return metadata_value
+    if isinstance(metadata_value, (int, float)):
+        return metadata_value != 0
+
+    value_text = str(metadata_value).strip().casefold()
+    if value_text in {"on", "yes", "true", "enabled"}:
+        return True
+    if value_text in {"off", "no", "false", "disabled"}:
+        return False
+
+    try:
+        return float(value_text) != 0
+    except ValueError:
+        return None
+
+
+def request_classification_timezone():
+    """Ask once for an IANA timezone, defaulting to EU CET/CEST rules."""
+    while True:
+        timezone_name = input(
+            "Timezone for daylight-saving checks "
+            f"[{DEFAULT_TIMEZONE_NAME}]: "
+        ).strip() or DEFAULT_TIMEZONE_NAME
+
+        try:
+            return timezone_name, ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError:
+            print(
+                f"Unknown timezone '{timezone_name}'. Enter an IANA name such "
+                "as Europe/Berlin, Europe/London, or America/New_York."
+            )
+
+
+def timezone_states_for_local_time(local_datetime, classification_timezone):
+    """
+    Return valid (DST state, UTC offset, abbreviation) states for local time.
+
+    Most local times have one state. The repeated hour at the autumn transition
+    has two. A spring-forward gap has none. UTC round-tripping distinguishes
+    these cases instead of assuming that attaching tzinfo always creates a
+    valid local time.
+    """
+    states = []
+    for fold in (0, 1):
+        aware_datetime = local_datetime.replace(
+            tzinfo=classification_timezone,
+            fold=fold,
+        )
+        round_trip = (
+            aware_datetime.astimezone(timezone.utc)
+            .astimezone(classification_timezone)
+            .replace(tzinfo=None)
+        )
+        if round_trip != local_datetime:
+            continue
+
+        dst_delta = aware_datetime.dst() or timedelta(0)
+        utc_offset = aware_datetime.utcoffset() or timedelta(0)
+        state = (
+            dst_delta != timedelta(0),
+            int(utc_offset.total_seconds() // 60),
+            aware_datetime.tzname() or "",
+        )
+        if state not in states:
+            states.append(state)
+
+    return states
+
+
+def daylight_saving_delta_for_year(classification_timezone, year):
+    """Return the largest DST adjustment used by the timezone in that year."""
+    current_date = datetime(year, 1, 1, 12)
+    end_date = datetime(year + 1, 1, 1, 12)
+    largest_delta = timedelta(0)
+
+    while current_date < end_date:
+        aware_date = current_date.replace(tzinfo=classification_timezone)
+        dst_delta = aware_date.dst() or timedelta(0)
+        if abs(dst_delta) > abs(largest_delta):
+            largest_delta = dst_delta
+        current_date += timedelta(days=1)
+
+    return largest_delta
+
+
+def format_utc_offset(offset_minutes):
+    """Format an offset in minutes as UTC+HH:MM or UTC-HH:MM."""
+    sign = "+" if offset_minutes >= 0 else "-"
+    absolute_minutes = abs(offset_minutes)
+    hours, minutes = divmod(absolute_minutes, 60)
+    return f"UTC{sign}{hours:02d}:{minutes:02d}"
+
+
+def format_daylight_records(records):
+    """Group daylight-saving metadata sources by file for display."""
+    fields_by_file = {}
+    for filename, source_name, state in records:
+        state_text = "ON" if state else "OFF"
+        item = f"{source_name}={state_text}"
+        fields_by_file.setdefault(filename, [])
+        if item not in fields_by_file[filename]:
+            fields_by_file[filename].append(item)
+
+    return ", ".join(
+        f"{filename.name} ({', '.join(items)})"
+        for filename, items in fields_by_file.items()
+    )
+
+
+def format_timezone_records(records):
+    """Group timezone-context metadata by file for display."""
+    fields_by_file = {}
+    for filename, source_name, raw_value, _ in records:
+        item = f"{source_name}={raw_value}"
+        fields_by_file.setdefault(filename, [])
+        if item not in fields_by_file[filename]:
+            fields_by_file[filename].append(item)
+
+    return ", ".join(
+        f"{filename.name} ({', '.join(items)})"
+        for filename, items in fields_by_file.items()
+    )
+
+
+def review_daylight_savings(
+    selected_file_date,
+    selected_date_option,
+    daylight_records,
+    timezone_records,
+    timezone_name,
+    classification_timezone,
+):
+    """
+    Offer a one-hour-style correction when camera DST metadata contradicts the
+    selected timezone's rule for the selected local date.
+
+    The original files are never rewritten. A correction changes only the date
+    used to classify copies. Explicit timestamp offsets are shown as evidence;
+    when one matches the expected timezone offset, keeping the wall-clock time
+    is recommended because only the maker-note flag may be stale.
+    """
+    if selected_file_date is None or not daylight_records:
+        return selected_file_date
+
+    selected_datetime = selected_file_date[1]
+    valid_states = timezone_states_for_local_time(
+        selected_datetime,
+        classification_timezone,
+    )
+    recorded_states = {state for _, _, state in daylight_records}
+
+    if not valid_states:
+        expected_state = None
+    else:
+        valid_dst_states = {state[0] for state in valid_states}
+        if recorded_states and recorded_states.issubset(valid_dst_states):
+            # Every camera setting is valid for this local time. This also
+            # handles the repeated autumn hour, where both DST states may be
+            # possible.
+            return selected_file_date
+        expected_state = (
+            next(iter(valid_dst_states))
+            if len(valid_dst_states) == 1
+            else None
+        )
+
+    print()
+    print("Daylight-saving review for this related group:")
+    print(f"  Timezone: {timezone_name}")
+    print(
+        "  Selected local time: "
+        f"{selected_datetime.strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    print(f"  Camera metadata: {format_daylight_records(daylight_records)}")
+
+    explicit_offsets = set(selected_date_option.get("offsets", set()))
+    explicit_offsets.update(
+        offset_minutes
+        for _, source_name, _, offset_minutes in timezone_records
+        if source_name.split(":")[-1] in TIMESTAMP_OFFSET_TAGS
+        and offset_minutes is not None
+    )
+    explicit_offsets = sorted(explicit_offsets)
+
+    if timezone_records:
+        print(
+            "  Timezone metadata: "
+            + format_timezone_records(timezone_records)
+        )
+
+    if explicit_offsets:
+        print(
+            "  Explicit timestamp offsets: "
+            + ", ".join(format_utc_offset(value) for value in explicit_offsets)
+        )
+
+    if not valid_states:
+        print(
+            "  This local wall-clock time falls inside a daylight-saving "
+            "transition gap and does not exist in the selected timezone."
+        )
+        correction_delta = daylight_saving_delta_for_year(
+            classification_timezone,
+            selected_datetime.year,
+        )
+        if correction_delta == timedelta(0):
+            return selected_file_date
+        corrected_datetime = selected_datetime + correction_delta
+    elif expected_state is None or len(recorded_states) != 1:
+        print(
+            "  The timezone rule or camera metadata is ambiguous, so no "
+            "single automatic correction can be inferred."
+        )
+        return selected_file_date
+    else:
+        expected_dst, expected_offset, timezone_abbreviation = valid_states[0]
+        recorded_dst = next(iter(recorded_states))
+        print(
+            "  Expected setting: "
+            f"{'ON' if expected_dst else 'OFF'} "
+            f"({timezone_abbreviation}, {format_utc_offset(expected_offset)})"
+        )
+
+        daylight_delta = daylight_saving_delta_for_year(
+            classification_timezone,
+            selected_datetime.year,
+        )
+        if daylight_delta == timedelta(0):
+            return selected_file_date
+
+        correction_delta = (
+            daylight_delta  if expected_dst and not recorded_dst
+            else -daylight_delta
+        )
+        corrected_datetime = selected_datetime + correction_delta
+
+        if expected_offset in explicit_offsets:
+            print(
+                "  At least one embedded timestamp already carries the "
+                "expected UTC offset. Keeping the time is recommended; the "
+                "maker-note daylight-saving flag may be stale."
+            )
+        else:
+            direction = "behind" if correction_delta > timedelta(0) else "ahead"
+            print(
+                f"  If the camer applied its recorded setting, its clock may "
+                f"be {abs(correction_delta.total_seconds()) / 3600:g} hour(s) "
+                f"{direction}."
+            )
+
+    print("Choose how this group should be classified:")
+    print(
+        "  1. Keep "
+        f"{selected_datetime.strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    print(
+        "  2. Correct to "
+        f"{corrected_datetime.strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+    while True:
+        raw_selection = input("Enter 1 or 2: ").strip()
+        if raw_selection == "1":
+            print()
+            return selected_file_date
+        if raw_selection == "2":
+            print(
+                "Selected daylight-saving correction: "
+                f"{corrected_datetime.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+            print()
+            return (2, corrected_datetime)
+        print("Invalid selection. Enter 1 or 2.")
 
 
 def get_dates(metadata_reader, filename):
     """
-    Return (date_candidates, review_reason, file_is_image).
+    Return dates, review reason, image flag, DST records, and timezone records.
 
     The first pass asks ExifTool for Time:All while excluding filesystem
     pseudo-tags and the specifically non-creation timestamps listed in
@@ -255,16 +599,20 @@ def get_dates(metadata_reader, filename):
         )
     except ExifToolExecuteError as error:
         if extension_is_image:
-            error_message = error.stderr.strip() or str(error)
+            error_message = (
+                str(error.stderr).strip() if error.stderr else str(error)
+            )
             return (
                 [],
                 f"ExifTool could not inspect the image ({error_message})",
                 True,
+                [],
+                [],
             )
 
         # Sidecars and other related files may legitimately contain no ExifTool
         # metadata. They remain usable members of the group but provide no date.
-        return [], None, False
+        return [], None, False, [], []
     except ExifToolException as error:
         raise OSError(
             f"ExifTool could not read metadata from '{filename}': {error}"
@@ -272,18 +620,46 @@ def get_dates(metadata_reader, filename):
 
     if not metadata_results:
         if extension_is_image:
-            return [], "ExifTool returned no metadata for the image", True
+            return (
+                [],
+                "ExifTool returned no metadata for the image",
+                True,
+                [],
+                [],
+            )
 
-        return [], None, False
+        return [], None, False, [], []
 
     metadata = metadata_results[0]
     file_is_image = is_image_file(filename, metadata)
     date_candidates = []
+    daylight_records = []
+    timezone_records = []
     invalid_date_messages = []
 
     for metadata_key, groups, tag_name, metadata_value in iter_metadata_values(
         metadata
     ):
+        if tag_name == "DaylightSavings":
+            daylight_state = parse_daylight_savings_value(metadata_value)
+            if daylight_state is not None:
+                daylight_records.append(
+                    (metadata_key, daylight_state)
+                )
+            continue
+
+        if tag_name in TIME_CONTEXT_TAGS:
+            timezone_records.append(
+                (
+                    metadata_key,
+                    str(metadata_value).strip(),
+                    parse_metadata_offset_value(metadata_value)
+                    if tag_name in TIMESTAMP_OFFSET_TAGS
+                    else None,
+                )
+            )
+            continue
+
         # These tags support file identification but are not dates.
         if tag_name in {"FileType", "MIMEType"}:
             continue
@@ -295,7 +671,9 @@ def get_dates(metadata_reader, filename):
             continue
 
         try:
-            metadata_date = parse_complete_metadata_datetime(metadata_value)
+            parsed_metadata_date = parse_complete_metadata_datetime(
+                metadata_value
+            )
         except ValueError:
             # A value with the complete date/time shape but invalid calendar
             # data remains a review case. Partial date/time values return None
@@ -305,11 +683,17 @@ def get_dates(metadata_reader, filename):
             )
             continue
 
-        if metadata_date is None:
+        if parsed_metadata_date is None:
             continue
 
+        metadata_date, timezone_offset_minutes = parsed_metadata_date
         date_candidates.append(
-            (1, metadata_date, metadata_key)
+            (
+                1,
+                metadata_date,
+                metadata_key,
+                timezone_offset_minutes,
+            )
         )
 
     if invalid_date_messages and file_is_image:
@@ -317,9 +701,17 @@ def get_dates(metadata_reader, filename):
             [],
             "invalid metadata date: " + "; ".join(invalid_date_messages),
             True,
+            daylight_records,
+            timezone_records,
         )
 
-    return date_candidates, None, file_is_image
+    return (
+        date_candidates,
+        None,
+        file_is_image,
+        daylight_records,
+        timezone_records,
+    )
 
 
 def get_file_modify_date(metadata_reader, filename):
@@ -367,7 +759,28 @@ def get_file_modify_date(metadata_reader, filename):
         0,
         modification_date,
         "File:System:FileModifyDate",
+        None,
     ), None
+
+
+def format_date_sources(sources):
+    """
+    Format one timestamp's sources with each filename displayed only once.
+
+    Repeated list values and duplicate tag instances are also collapsed so the
+    prompt shows a concise list of unique fields for each file.
+    """
+    fields_by_file = {}
+
+    for filename, source_name in sources:
+        source_fields = fields_by_file.setdefault(filename, [])
+        if source_name not in source_fields:
+            source_fields.append(source_name)
+
+    return ", ".join(
+        f"{filename.name} ({', '.join(source_fields)})"
+        for filename, source_fields in fields_by_file.items()
+    )
 
 
 def stems_are_related(base_stem, longer_stem):
@@ -507,26 +920,6 @@ def copy_file_safely(source_file, requested_destination):
         return destination_file, True, suffix_number > 0
 
 
-def format_date_sources(sources):
-    """
-    Format one timestamp's sources with each filename displayed only once.
-
-    Repeated list values and duplicate tag instances are also collapsed so the
-    prompt shows a concise list of unique fields for each file.
-    """
-    fields_by_file = {}
-
-    for filename, source_name in sources:
-        source_fields = fields_by_file.setdefault(filename, [])
-        if source_name not in source_fields:
-            source_fields.append(source_name)
-
-    return ", ".join(
-        f"{filename.name} ({', '.join(source_fields)})"
-        for filename, source_fields in fields_by_file.items()
-    )
-
-
 # Request the source directory in the same interactive style as the original.
 # The script deliberately examines only regular files located directly inside
 # this directory. It never walks into existing subdirectories.
@@ -540,6 +933,7 @@ if not directory.exists() or not directory.is_dir():
     raise SystemExit(1)
 
 directory = directory.resolve()
+timezone_name, classification_timezone = request_classification_timezone()
 
 # Create the two output locations inside the selected directory:
 #
@@ -615,15 +1009,24 @@ for base_stem, same_stem_files in same_stem_groups:
     file_dates = {}
     usable_files = set()
     base_image_files = []
+    daylight_records_by_file = {}
+    timezone_records_by_file = {}
     review_reasons = {}
     selected_file_date = None
+    selected_date_option = None
 
     # First pass: collect only embedded metadata timestamps from every related
     # file. Sidecars may contribute embedded XMP/IPTC metadata, but no file in
     # this pass contributes filesystem timestamps.
     for same_stem_file in same_stem_files:
         try:
-            date_candidates, review_reason, file_is_image = get_dates(
+            (
+                date_candidates,
+                review_reason,
+                file_is_image,
+                daylight_records,
+                timezone_records,
+            ) = get_dates(
                 metadata_reader,
                 same_stem_file,
             )
@@ -645,6 +1048,11 @@ for base_stem, same_stem_files in same_stem_groups:
             continue
 
         usable_files.add(same_stem_file)
+
+        if daylight_records:
+            daylight_records_by_file[same_stem_file] = daylight_records
+        if timezone_records:
+            timezone_records_by_file[same_stem_file] = timezone_records
 
         if date_candidates:
             file_dates[same_stem_file] = date_candidates
@@ -704,10 +1112,15 @@ for base_stem, same_stem_files in same_stem_groups:
     # The complete source paths are retained for the numbered conflict list.
     date_options = {}
     for same_stem_file, date_candidates in file_dates.items():
-        for date_type, date_value, source_name in date_candidates:
+        for (
+            date_type,
+            date_value,
+            source_name,
+            timezone_offset_minutes,
+        ) in date_candidates:
             date_option = date_options.setdefault(
                 date_value,
-                {"date_type": date_type, "sources": []},
+                {"date_type": date_type, "sources": [], "offsets": set()},
             )
             date_option["date_type"] = max(
                 date_option["date_type"],
@@ -716,11 +1129,14 @@ for base_stem, same_stem_files in same_stem_groups:
             date_option["sources"].append(
                 (same_stem_file, source_name)
             )
+            if timezone_offset_minutes is not None:
+                date_option["offsets"].add(timezone_offset_minutes)
 
     if len(date_options) == 1:
         # Every available field agrees on one timestamp, so no user interaction
         # is required. Use the strongest source associated with that timestamp.
         date_value, date_option = next(iter(date_options.items()))
+        selected_date_option = date_option
         selected_file_date = (
             date_option["date_type"],
             date_value,
@@ -781,6 +1197,44 @@ for base_stem, same_stem_files in same_stem_groups:
             )
             print()
             break
+
+    if (
+        selected_file_date is not None
+        and selected_file_date[0] == 1
+        and selected_date_option is not None
+    ):
+        base_image_daylight_records = []
+        base_image_timezone_records = []
+        for base_image_file in base_image_files:
+            for source_name, state in daylight_records_by_file.get(
+                base_image_file,
+                [],
+            ):
+                base_image_daylight_records.append(
+                    (base_image_file, source_name, state)
+                )
+            for (
+                source_name,
+                raw_value,
+                offset_minutes,
+            ) in timezone_records_by_file.get(base_image_file, []):
+                base_image_timezone_records.append(
+                    (
+                        base_image_file,
+                        source_name,
+                        raw_value,
+                        offset_minutes,
+                    )
+                )
+
+        selected_file_date = review_daylight_savings(
+            selected_file_date,
+            selected_date_option,
+            base_image_daylight_records,
+            base_image_timezone_records,
+            timezone_name,
+            classification_timezone,
+        )
 
     for same_stem_file in same_stem_files:
         if same_stem_file in review_reasons:
