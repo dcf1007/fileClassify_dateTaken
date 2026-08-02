@@ -1,8 +1,22 @@
 # fileClassify_dateTaken
 
-Python script that takes the files directly inside a selected directory and copies them into date-based subdirectories according to supported EXIF date fields. If none of those EXIF fields is available, the filesystem modification time is used.
+Python script that takes the files directly inside a selected directory and copies them into date-based subdirectories according to metadata timestamps. If no complete embedded timestamp is available, the filesystem modification time is used.
 
 The script does not scan subdirectories. Classified copies are written to `classified/YYYY-MM-DD`, while damaged files or files with unreliable image metadata are copied to `unclassified` for manual review. Original files are not moved or overwritten.
+
+## Metadata extraction
+
+The script uses PyExifTool to request ExifTool's complete `Time:All` group. Extraction is performed with:
+
+```text
+-G0:1:4 -a -ee -Time:All
+```
+
+This reads timestamps from EXIF, XMP, IPTC, QuickTime, maker notes, composite tags, and other metadata families supported by ExifTool. The group levels preserve the metadata type, exact storage location, and duplicate instance number, so non-standard or duplicate tags are not hidden.
+
+ExifTool validation warnings are shown to the user but do not automatically make a readable file unclassified. Actual ExifTool errors or validation errors still send known image files to `unclassified`.
+
+When distinct complete timestamps are found, the script displays their full ExifTool source paths and asks the user to choose the date for the related file group.
 
 ## Requirements
 
