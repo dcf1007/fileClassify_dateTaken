@@ -14,9 +14,11 @@ The script uses PyExifTool to request ExifTool's complete `Time:All` group. Extr
 
 This reads timestamps from EXIF, XMP, IPTC, QuickTime, maker notes, composite tags, and other metadata families supported by ExifTool. The group levels preserve the metadata type, exact storage location, and duplicate instance number, so non-standard or duplicate tags are not hidden.
 
-ExifTool validation warnings are shown to the user but do not automatically make a readable file unclassified. Actual ExifTool errors or validation errors still send known image files to `unclassified`.
+The normal classification pass does not request ExifTool's `Validate`, `Warning`, or `Error` pseudo-tags. Validation performs additional metadata-conformance checks and can report non-standard tag placement even when the timestamp is readable. Timestamp discovery does not require those checks.
 
-When distinct complete timestamps are found, the script displays their full ExifTool source paths and asks the user to choose the date for the related file group.
+Filesystem pseudo-tags returned by `Time:All`, including `FileModifyDate`, `FileCreateDate`, and `FileAccessDate`, are excluded from the metadata choices. The filesystem modification time is used only as a fallback when no complete embedded timestamp exists.
+
+When distinct complete embedded timestamps are found, the script displays their full ExifTool source paths and asks the user to choose the date for the related file group.
 
 ## Requirements
 
