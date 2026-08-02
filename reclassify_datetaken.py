@@ -15,7 +15,8 @@ PIL.Image.init()
 DATETYPE = {0: "OS_DATE", 1: "EXIF"}
 EXIF_DATE_TAG = 36867
 EXIF_DATE_FORMAT = "%Y:%m:%d %H:%M:%S"
-REVIEW_FOLDER_NAME = "to be reviewed"
+CLASSIFIED_FOLDER_NAME = "classified"
+UNCLASSIFIED_FOLDER_NAME = "unclassified"
 COPY_CHUNK_SIZE = 1024 * 1024
 IMAGE_EXTENSIONS = {
     extension.casefold()
@@ -53,8 +54,14 @@ def get_date(filename):
             if callable(legacy_exif_reader):
                 try:
                     exif_data = legacy_exif_reader()
-                except (AttributeError, IndexError, KeyError, OSError,
-                        TypeError, ValueError) as error:
+                except (
+                    AttributeError,
+                    IndexError,
+                    KeyError,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                ) as error:
                     return None, None, f"could not read EXIF metadata ({error})"
 
                 if exif_data:
@@ -66,8 +73,14 @@ def get_date(filename):
                 if tiff_tags is not None:
                     try:
                         exif_date_text = tiff_tags.get(EXIF_DATE_TAG)
-                    except (AttributeError, IndexError, KeyError, OSError,
-                            TypeError, ValueError) as error:
+                    except (
+                        AttributeError,
+                        IndexError,
+                        KeyError,
+                        OSError,
+                        TypeError,
+                        ValueError,
+                    ) as error:
                         return None, None, f"could not read TIFF metadata ({error})"
 
             # An image that opens but fails verification is not trusted.
@@ -234,7 +247,9 @@ def copy_file_safely(source_file, requested_destination):
         return destination_file, True, suffix_number > 0
 
 
-# Request source and output paths in the interactive style of the original.
+# Request the source directory in the same interactive style as the original.
+# The script deliberately examines only regular files located directly inside
+# this directory. It never walks into existing subdirectories.
 directory = clean_input_path(
     input("Please write (or drag) the source directory path: ")
 )
@@ -244,46 +259,39 @@ if not directory.exists() or not directory.is_dir():
     input("Press Enter to exit")
     raise SystemExit(1)
 
-default_output_directory = directory.parent / f"{directory.name}_classified"
-raw_output_directory = input(
-    "Please write (or drag) the output directory path "
-    f"[{default_output_directory}]: "
-)
-output_directory = (
-    clean_input_path(raw_output_directory)
-    if raw_output_directory.strip()
-    else default_output_directory
-)
-
 directory = directory.resolve()
-output_directory = output_directory.resolve()
 
-# The output must be separate and outside the source tree, ensuring that the
-# source remains unchanged and generated files cannot enter the input scan.
-if output_directory == directory:
-    print("Error: output and source directories must be different.")
-    input("Press Enter to exit")
-    raise SystemExit(1)
+# Create the two output locations inside the selected directory:
+#
+#   classified/
+#       YYYY-MM-DD/
+#           successfully classified copies
+#
+#   unclassified/
+#       damaged or otherwise unreliable images requiring manual review
+#
+# These directories are not included in processing because the input snapshot
+# below contains only files directly in the selected directory. No recursive
+# directory traversal is performed.
+classified_directory = directory / CLASSIFIED_FOLDER_NAME
+unclassified_directory = directory / UNCLASSIFIED_FOLDER_NAME
+
+for output_directory in (classified_directory, unclassified_directory):
+    if output_directory.exists() and not output_directory.is_dir():
+        print(
+            f"Error: '{output_directory}' already exists as a file. "
+            "It must be a directory."
+        )
+        input("Press Enter to exit")
+        raise SystemExit(1)
 
 try:
-    output_directory.relative_to(directory)
-except ValueError:
-    pass
-else:
-    print("Error: the output directory cannot be inside the source directory.")
-    input("Press Enter to exit")
-    raise SystemExit(1)
+    classified_directory.mkdir(exist_ok=True)
+    unclassified_directory.mkdir(exist_ok=True)
 
-if output_directory.exists() and not output_directory.is_dir():
-    print(f"Error: output path exists as a file: '{output_directory}'")
-    input("Press Enter to exit")
-    raise SystemExit(1)
-
-try:
-    output_directory.mkdir(parents=True, exist_ok=True)
-
-    # Snapshot regular, non-symlink files once. Directories can therefore
-    # neither join a stem group nor be copied unintentionally.
+    # Snapshot regular, non-symlink files once. Using iterdir() here is
+    # intentionally non-recursive: files inside classified, unclassified, or
+    # any other subdirectory are never examined.
     source_files = sorted(
         (
             filename
@@ -346,11 +354,12 @@ for same_stem_files in same_stem_groups:
 
     for same_stem_file in same_stem_files:
         if same_stem_file in review_reasons:
-            folder_name = REVIEW_FOLDER_NAME
-            destination_directory = output_directory / REVIEW_FOLDER_NAME
+            folder_name = UNCLASSIFIED_FOLDER_NAME
+            destination_directory = unclassified_directory
         elif same_stem_file in file_dates and selected_file_date is not None:
-            folder_name = selected_file_date[1].strftime("%Y-%m-%d")
-            destination_directory = output_directory / folder_name
+            date_folder_name = selected_file_date[1].strftime("%Y-%m-%d")
+            folder_name = f"{CLASSIFIED_FOLDER_NAME}/{date_folder_name}"
+            destination_directory = classified_directory / date_folder_name
         else:
             continue
 
@@ -399,13 +408,14 @@ for same_stem_files in same_stem_groups:
         print()
 
 print()
-print(f"Output directory: {output_directory}")
+print(f"Classified directory: {classified_directory}")
+print(f"Unclassified directory: {unclassified_directory}")
 print(f"Copied files: {copied_count}")
 print(f"Binary duplicates: {duplicate_count}")
 print(f"Renamed collision copies: {renamed_count}")
 print(f"Files sent for review: {review_count}")
 print(f"Failed files: {failed_count}")
-print("The source directory was not modified.")
+print("Original source files were not modified.")
 
 input("Press Enter to exit")
 
