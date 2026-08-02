@@ -78,9 +78,10 @@ FILE_MODIFY_DATE_PARAMS = [
 
 EXIF_DATE_FORMAT = "%Y:%m:%d %H:%M:%S"
 COMPLETE_DATE_TIME_PATTERN = re.compile(
-    r"^\d{4}[:-]\d{2}[:-]\d{2}[ T]"
-    r"\d{2}:\d{2}:\d{2}(?:\.\d+)?"
-    r"(?:Z|[+-]\d{2}:?\d{2})?$"
+    r"^(?P<year>\d{4})[:-](?P<month>\d{2})[:-](?P<day>\d{2})[ T]"
+    r"(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})"
+    r"(?:\.(?P<fraction>\d+))?"
+    r"(?P<timezone>Z|[+-]\d{2}:?\d{2})?$"
 )
 CLASSIFIED_FOLDER_NAME = "classified"
 UNCLASSIFIED_FOLDER_NAME = "unclassified"
@@ -190,54 +191,44 @@ def is_image_file(filename, metadata):
 
 def parse_complete_metadata_datetime(metadata_value):
     """
-    Parse one complete ExifTool date/time value without inventing components.
+    Parse one complete ExifTool date/time into the classifier's canonical form.
 
-    The embedded metadata pass keeps ExifTool's raw values. Date-only values
-    such as IPTC DateCreated and time-only values such as IPTC TimeCreated do
-    not match COMPLETE_DATE_TIME_PATTERN and return None. Composite fields that
-    combine both components remain eligible.
+    The embedded metadata pass keeps ExifTool's raw values so date-only and
+    time-only fields can be rejected without inventing missing components. A
+    complete timestamp may include fractional seconds and a timezone suffix.
 
-    Timezone offsets and fractional seconds are accepted. The classifier keeps
-    its existing wall-clock comparison and folder behavior by removing timezone
-    information after parsing.
+    Classification comparisons intentionally use one-second resolution. EXIF
+    often stores whole seconds while XMP and ExifTool Composite fields retain
+    fractions for the same capture event. Constructing the result directly from
+    year through second gives every caller the same canonical representation at
+    the parser boundary, before candidates are grouped or displayed.
+
+    Timezone suffixes are syntax-checked but retain the existing wall-clock
+    behavior: they are not converted to another timezone.
     """
     date_text = str(metadata_value).strip()
-    if not COMPLETE_DATE_TIME_PATTERN.fullmatch(date_text):
+    date_match = COMPLETE_DATE_TIME_PATTERN.fullmatch(date_text)
+    if date_match is None:
         return None
 
-    normalized_date_text = date_text
+    timezone_text = date_match.group("timezone")
+    if timezone_text and timezone_text != "Z":
+        timezone_hour = int(timezone_text[1:3])
+        timezone_minute = int(timezone_text[-2:])
+        if timezone_hour > 23 or timezone_minute > 59:
+            raise ValueError(f"invalid timezone offset {timezone_text!r}")
 
-    # datetime.fromisoformat expects hyphens in the calendar portion. ExifTool
-    # commonly uses EXIF's YYYY:MM:DD form, so normalize only those separators.
-    if normalized_date_text[4] == ":" and normalized_date_text[7] == ":":
-        normalized_date_text = (
-            normalized_date_text[:4]
-            + "-"
-            + normalized_date_text[5:7]
-            + "-"
-            + normalized_date_text[8:]
-        )
-
-    if normalized_date_text[10] == " ":
-        normalized_date_text = (
-            normalized_date_text[:10]
-            + "T"
-            + normalized_date_text[11:]
-        )
-
-    if normalized_date_text.endswith("Z"):
-        normalized_date_text = normalized_date_text[:-1] + "+00:00"
-
-    # Accept offsets written as +HHMM in addition to +HH:MM.
-    if re.search(r"[+-]\d{4}$", normalized_date_text):
-        normalized_date_text = (
-            normalized_date_text[:-2]
-            + ":"
-            + normalized_date_text[-2:]
-        )
-
-    parsed_date = datetime.fromisoformat(normalized_date_text)
-    return parsed_date.replace(tzinfo=None)
+    # Deliberately construct only through whole seconds. The optional fractional
+    # component was validated by the pattern but is not part of classification
+    # identity, matching the precision shown in prompts and final summaries.
+    return datetime(
+        int(date_match.group("year")),
+        int(date_match.group("month")),
+        int(date_match.group("day")),
+        int(date_match.group("hour")),
+        int(date_match.group("minute")),
+        int(date_match.group("second")),
+    )
 
 
 def get_dates(metadata_reader, filename):
@@ -379,26 +370,6 @@ def get_file_modify_date(metadata_reader, filename):
     ), None
 
 
-def format_date_sources(sources):
-    """
-    Format one timestamp's sources with each filename displayed only once.
-
-    Repeated list values and duplicate tag instances are also collapsed so the
-    prompt shows a concise list of unique fields for each file.
-    """
-    fields_by_file = {}
-
-    for filename, source_name in sources:
-        source_fields = fields_by_file.setdefault(filename, [])
-        if source_name not in source_fields:
-            source_fields.append(source_name)
-
-    return ", ".join(
-        f"{filename.name} ({', '.join(source_fields)})"
-        for filename, source_fields in fields_by_file.items()
-    )
-
-
 def stems_are_related(base_stem, longer_stem):
     """
     A derivative must begin with the complete base stem. Its first added
@@ -534,6 +505,26 @@ def copy_file_safely(source_file, requested_destination):
             raise
 
         return destination_file, True, suffix_number > 0
+
+
+def format_date_sources(sources):
+    """
+    Format one timestamp's sources with each filename displayed only once.
+
+    Repeated list values and duplicate tag instances are also collapsed so the
+    prompt shows a concise list of unique fields for each file.
+    """
+    fields_by_file = {}
+
+    for filename, source_name in sources:
+        source_fields = fields_by_file.setdefault(filename, [])
+        if source_name not in source_fields:
+            source_fields.append(source_name)
+
+    return ", ".join(
+        f"{filename.name} ({', '.join(source_fields)})"
+        for filename, source_fields in fields_by_file.items()
+    )
 
 
 # Request the source directory in the same interactive style as the original.
