@@ -70,31 +70,28 @@ The default timezone alone is an assumption and never proves that the camera clo
 
 A corrected classification value is reported as `METADATA_TIMEZONE_CORRECTED`.
 
-### EXIF updates in corrected copies
+### Metadata updates in corrected copies
 
-When the user accepts a timezone or daylight-saving correction, the script applies the same exact time shift to existing common EXIF timestamp fields in every classified image copy in that related group:
+When the user accepts a timezone or daylight-saving correction, the script first creates the normal collision-safe copy in `classified` and then edits that copy in place. No separate application-level temporary copy is built, and the original source file remains untouched. ExifTool may still use its own internal safe-write mechanism while replacing metadata.
 
-```text
-DateTimeOriginal
-CreateDate
-ModifyDate
-```
+The correction pass reads existing `Time:All` values and applies the approved correction by semantics rather than by camera brand:
 
-Each field is shifted from its own existing value. The script does not replace all three fields with one timestamp, so legitimate differences between capture, digitization, and modification times are preserved. Duplicate EXIF locations are handled independently. Missing EXIF date fields are not created, and separate subsecond fields remain unchanged.
+- complete local timestamps without an offset are shifted by the approved delta;
+- timestamps carrying an inline UTC offset keep their wall-clock value and receive the corrected offset;
+- EXIF timestamps paired with `OffsetTime`, `OffsetTimeOriginal`, or `OffsetTimeDigitized` keep their wall-clock value while the existing offset field is corrected;
+- paired IPTC date-only/time-only fields are corrected together, including midnight rollover;
+- known UTC references such as `GPSDateTime` and `DateTimeUTC` are not altered;
+- embedded-resource and application-history fields such as ICC profile dates, Photoshop layer dates, FlashPix extension dates, `MetadataDate`, and `HistoryWhen` are not treated as camera-local clock values.
 
-For every shifted timestamp type, the corresponding standard EXIF UTC-offset field is set to the corrected IANA-zone offset when that local time has one unambiguous offset:
+The same generic pass covers writable EXIF, XMP, IPTC, QuickTime, maker-note, image, video, and sidecar fields. Read-only or unsupported fields are reported as skipped instead of preventing other writable fields from being corrected.
 
-```text
-OffsetTimeOriginal
-OffsetTimeDigitized
-OffsetTime
-```
+Existing standalone offset fields such as `OffsetTimeOriginal`, `OffsetTimeDigitized`, `OffsetTime`, `TimeZoneOffset`, `TimeZone`, and `TimeOffset` are updated when their representation can be interpreted safely. Missing metadata fields are not created.
 
-The repeated autumn hour can have two valid UTC offsets. In that ambiguous case, the timestamp is shifted as selected, but the script does not guess an offset value.
+Existing camera daylight-saving settings are also updated when ExifTool can write them. This includes direct `DaylightSavings` fields and the active Pentax/Ricoh hometown or destination DST field selected by `WorldTimeLocation`. The raw ON encoding is preserved when present; Canon's documented 60-minute ON representation is used when a zero-valued Canon field must be enabled. Unsupported or read-only maker-note fields are left unchanged and reported.
 
-Metadata is written only to a temporary output copy. ExifTool then reads the temporary file back, and the script verifies every shifted EXIF timestamp and every intended offset before collision-safe placement in `classified`. If the metadata write or verification fails, the temporary file is removed and no partially corrected destination is retained. Binary-duplicate comparison uses the final corrected bytes, so a repeated run can recognize an already-corrected copy.
+The filesystem `FileModifyDate` is set from the source file's timestamp plus the approved correction on every corrected copy. This includes groups classified from the system fallback and makes repeated runs idempotent. `FileCreateDate` is also corrected when the operating system exposes it and ExifTool can write it.
 
-Vendor-specific maker-note daylight-saving settings are not rewritten because their encodings and writability vary by manufacturer. GPS and UTC-reference fields are also left unchanged because they represent the absolute instant used to validate the correction. This write step is deliberately limited to EXIF: XMP, IPTC, QuickTime, and sidecar timestamps are not changed.
+After writing, the script reads the classified copy back and verifies writable metadata semantically. If a newly created copy cannot be corrected safely, it is removed. After correction, collision candidates are compared again so repeated runs recognize an existing corrected output rather than retaining an unnecessary numbered duplicate.
 
 Original source files and their metadata are never modified.
 

@@ -1,7 +1,7 @@
+import os
 import re
 import shutil
 import sys
-import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -85,33 +85,40 @@ for excluded_time_tag in EXCLUDED_TIME_TAGS:
     EXIFTOOL_READ_PARAMS.extend(["-x", excluded_time_tag])
 
 FILE_MODIFY_DATE_TAGS = ["FileModifyDate"]
-FILE_MODIFY_DATE_PARAMS = [
-    "-d",
-    "%Y:%m:%d %H:%M:%S",
-]
+FILE_MODIFY_DATE_PARAMS = []
 
 EXIF_DATE_FORMAT = "%Y:%m:%d %H:%M:%S"
 
-# A user-approved timezone correction is also written to existing common EXIF
-# timestamp fields in each image copy. The fields are shifted independently by
-# the same exact timedelta, preserving legitimate differences between capture,
-# digitization, and modification times instead of replacing every field with
-# one selected value. Missing EXIF date fields are not invented.
-EXIF_DATE_OFFSET_TAGS = {
+# Metadata correction is driven by timestamp semantics rather than camera make.
+# Existing local wall-clock values are shifted, aware values keep their clock
+# reading and receive the corrected offset, and known UTC references remain
+# unchanged. The write pass never creates missing date/time fields.
+ASSOCIATED_OFFSET_TAGS = {
     "DateTimeOriginal": "OffsetTimeOriginal",
     "CreateDate": "OffsetTimeDigitized",
     "ModifyDate": "OffsetTime",
 }
-EXIF_CORRECTION_READ_TAGS = [
-    *(f"EXIF:{tag_name}" for tag_name in EXIF_DATE_OFFSET_TAGS),
-    *(f"EXIF:{tag_name}" for tag_name in EXIF_DATE_OFFSET_TAGS.values()),
-]
-EXIF_CORRECTION_WRITE_PARAMS = [
-    # Work only on a temporary copy, but still avoid ExifTool backup files.
+PARTIAL_DATE_TIME_PAIRS = (
+    ("DateCreated", "TimeCreated"),
+    ("DigitalCreationDate", "DigitalCreationTime"),
+)
+NONLOCAL_CORRECTION_TAGS = {
+    "PowerUpTime",
+    "TimeSincePowerOn",
+    "RunTimeSincePowerUp",
+    "ShotNumberSincePowerUp",
+    "MetadataDate",
+    "HistoryWhen",
+    "ProfileDateTime",
+    "LayerModifyDates",
+    "ExtensionCreateDate",
+    "ExtensionModifyDate",
+}
+CORRECTION_WRITE_PARAMS = [
     "-overwrite_original_in_place",
-    # Preserve the copied filesystem modification timestamp while metadata is
-    # rewritten. copystat() below restores all copied attributes once more.
     "-P",
+    "-wm",
+    "w",
 ]
 
 DIRECT_DST_TAGS = {"DaylightSavings"}
@@ -147,7 +154,17 @@ TIME_CONTEXT_TAGS = (
 UTC_REFERENCE_TAGS = {
     "DateTimeUTC",
     "GPSDateTime",
+    "GPSDateStamp",
+    "GPSTimeStamp",
+    "UTCDateTime",
 }
+
+CORRECTION_READ_TAGS = [
+    "Time:All",
+    *sorted(TIME_CONTEXT_TAGS),
+    "File:FileCreateDate",
+]
+CORRECTION_READ_PARAMS = ["-a", "-ee"]
 
 COMPLETE_DATE_TIME_PATTERN = re.compile(
     r"^(?P<year>\d{4})[:-](?P<month>\d{2})[:-](?P<day>\d{2})[ T]"
@@ -159,6 +176,14 @@ SIGNED_OFFSET_PATTERN = re.compile(
     r"(?<!\d)(?:UTC|GMT)?\s*(?P<sign>[+-])"
     r"(?P<hour>\d{1,2})(?::?(?P<minute>\d{2}))?(?!\d)",
     re.IGNORECASE,
+)
+DATE_ONLY_PATTERN = re.compile(
+    r"^(?P<year>\d{4})[:-](?P<month>\d{2})[:-](?P<day>\d{2})$"
+)
+TIME_ONLY_PATTERN = re.compile(
+    r"^(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})"
+    r"(?:\.(?P<fraction>\d+))?"
+    r"(?P<timezone>Z|[+-]\d{2}:?\d{2})?$"
 )
 
 CLASSIFIED_FOLDER_NAME = "classified"
@@ -474,242 +499,641 @@ def format_utc_offset(offset_minutes):
 
 
 def format_exif_offset(offset_minutes):
-    """Format an offset in minutes for standard EXIF OffsetTime* fields."""
+    """Format an offset in minutes for EXIF/XMP offset values."""
     sign = "+" if offset_minutes >= 0 else "-"
     absolute_minutes = abs(offset_minutes)
     hours, minutes = divmod(absolute_minutes, 60)
     return f"{sign}{hours:02d}:{minutes:02d}"
 
 
-def get_exif_write_target(groups, tag_name):
-    """Return the family-1 EXIF target represented by a -G0:1:4 key."""
-    if not groups or groups[0] != "EXIF":
-        return None
-
-    # Family 1 identifies the actual IFD. Family 4 may add extraction-only
-    # instance labels such as Copy1, which must not be used for writing.
-    if len(groups) >= 2 and not groups[1].casefold().startswith("copy"):
-        return f"{groups[1]}:{tag_name}"
-    return f"EXIF:{tag_name}"
-
-
-def read_exif_correction_state(metadata_reader, filename):
-    """
-    Read existing common EXIF timestamps and standard offset fields.
-
-    Timestamp values are keyed by their writable IFD target so duplicate EXIF
-    locations are shifted and verified independently rather than collapsed by
-    final tag name.
-    """
-    try:
-        metadata_results = metadata_reader.get_tags(
-            files=filename,
-            tags=EXIF_CORRECTION_READ_TAGS,
-            params=["-a"],
-        )
-    except ExifToolException as error:
-        raise OSError(
-            f"ExifTool could not inspect EXIF correction fields in "
-            f"'{filename}': {error}"
-        ) from error
-
-    timestamps_by_target = {}
-    offsets_by_target = {}
-    offset_targets_by_tag = {}
-    if not metadata_results:
-        return (
-            timestamps_by_target,
-            offsets_by_target,
-            offset_targets_by_tag,
-        )
-
-    offset_tag_names = set(EXIF_DATE_OFFSET_TAGS.values())
-    for metadata_key, groups, tag_name, metadata_value in iter_metadata_values(
-        metadata_results[0]
-    ):
-        if not groups or groups[0] != "EXIF":
-            continue
-
-        write_target = get_exif_write_target(groups, tag_name)
-        if tag_name in EXIF_DATE_OFFSET_TAGS:
-            try:
-                parsed_date = parse_complete_metadata_datetime(metadata_value)
-            except ValueError as error:
-                raise OSError(
-                    f"cannot shift invalid EXIF timestamp "
-                    f"{metadata_key}={metadata_value!r}: {error}"
-                ) from error
-            if parsed_date is None:
-                raise OSError(
-                    f"cannot shift incomplete EXIF timestamp "
-                    f"{metadata_key}={metadata_value!r}"
-                )
-            timestamps_by_target.setdefault(write_target, []).append(
-                parsed_date[0]
-            )
-            continue
-
-        if tag_name in offset_tag_names:
-            offset_minutes = parse_context_offset(tag_name, metadata_value)
-            if offset_minutes is None:
-                raise OSError(
-                    f"cannot interpret EXIF offset "
-                    f"{metadata_key}={metadata_value!r}"
-                )
-            offsets_by_target.setdefault(write_target, []).append(
-                offset_minutes
-            )
-            offset_targets_by_tag.setdefault(tag_name, set()).add(
-                write_target
-            )
-
-    return timestamps_by_target, offsets_by_target, offset_targets_by_tag
+def get_unambiguous_timezone_state(local_datetime, classification_timezone):
+    """Return the sole valid (DST, offset, abbreviation) state, or None."""
+    states = timezone_states_for_local_time(
+        local_datetime,
+        classification_timezone,
+    )
+    return states[0] if len(states) == 1 else None
 
 
 def get_unambiguous_timezone_offset(local_datetime, classification_timezone):
     """Return the sole valid UTC offset for a local time, or None."""
-    offsets = {
-        state[1]
-        for state in timezone_states_for_local_time(
-            local_datetime,
-            classification_timezone,
-        )
-    }
-    return next(iter(offsets)) if len(offsets) == 1 else None
+    state = get_unambiguous_timezone_state(
+        local_datetime,
+        classification_timezone,
+    )
+    return state[1] if state is not None else None
 
 
-def update_corrected_exif_metadata(
-    metadata_reader,
-    filename,
-    correction_delta,
-    classification_timezone,
-):
-    """
-    Shift and verify existing common EXIF timestamps in one temporary copy.
+def get_metadata_write_target(groups, tag_name, raw=False):
+    """Map a -G0:1:4 extraction path to an explicit writable group target."""
+    if not groups or "System" in groups or groups[0] in {"Composite", "File"}:
+        return None
 
-    DateTimeOriginal, CreateDate, and ModifyDate are shifted at every EXIF IFD
-    where they already exist. Their corresponding standard OffsetTime* fields
-    are set to the corrected IANA-zone offset when that offset is unambiguous.
-    Vendor maker notes and UTC/GPS reference fields are intentionally untouched.
-    """
-    (
-        timestamps_before,
-        _,
-        existing_offset_targets,
-    ) = read_exif_correction_state(metadata_reader, filename)
-    if not timestamps_before:
-        return []
+    family_zero = groups[0]
+    family_one = None
+    for group_name in groups[1:]:
+        if not group_name.casefold().startswith("copy"):
+            family_one = group_name
+            break
 
-    correction_seconds = int(correction_delta.total_seconds())
-    if correction_delta != timedelta(seconds=correction_seconds):
-        raise OSError(
-            "timezone correction contains subsecond precision and cannot be "
-            "applied safely to whole-second EXIF date fields"
-        )
-    if correction_seconds == 0:
-        return []
+    target_group = family_one or family_zero
+    raw_suffix = "#" if raw else ""
+    return f"{target_group}:{tag_name}{raw_suffix}"
 
-    shift_operator = "+=" if correction_seconds > 0 else "-="
-    shift_value = f"0:0:{abs(correction_seconds)}"
-    write_arguments = list(EXIF_CORRECTION_WRITE_PARAMS)
-    for write_target in sorted(timestamps_before):
-        write_arguments.append(
-            f"-{write_target}{shift_operator}{shift_value}"
-        )
 
-    # Determine the correct offset independently for original, digitized, and
-    # modification times. ModifyDate may legitimately fall under a different
-    # seasonal offset than the capture date. One standard OffsetTime* field
-    # cannot represent conflicting duplicate dates, so such a file is rejected
-    # instead of writing a value that is correct for only one occurrence.
-    shifted_values_by_tag = {}
-    for write_target, old_values in timestamps_before.items():
-        timestamp_tag_name = write_target.rsplit(":", 1)[-1]
-        shifted_values_by_tag.setdefault(timestamp_tag_name, []).extend(
-            old_value + correction_delta for old_value in old_values
-        )
+def format_complete_datetime(original_value, local_datetime, offset_minutes=None):
+    """Preserve a timestamp's syntax while replacing its date/time components."""
+    original_text = str(original_value).strip()
+    date_match = COMPLETE_DATE_TIME_PATTERN.fullmatch(original_text)
+    if date_match is None:
+        raise ValueError(f"not a complete timestamp: {original_value!r}")
 
-    expected_offset_targets = {}
-    for timestamp_tag_name, shifted_values in sorted(
-        shifted_values_by_tag.items()
-    ):
-        offset_results = [
-            get_unambiguous_timezone_offset(
-                shifted_value,
-                classification_timezone,
-            )
-            for shifted_value in shifted_values
-        ]
-        if any(offset_result is None for offset_result in offset_results):
-            # At least one value falls in the repeated autumn hour. Do not use
-            # another duplicate occurrence to guess the ambiguous offset.
-            continue
-        possible_offsets = set(offset_results)
-        if len(possible_offsets) > 1:
-            raise OSError(
-                f"cannot assign one EXIF offset to conflicting shifted "
-                f"{timestamp_tag_name} values: {shifted_values!r}"
-            )
-        if not possible_offsets:
-            # The repeated autumn hour has two valid offsets. Do not guess.
-            continue
+    date_separator = original_text[4]
+    datetime_separator = original_text[10]
+    fraction = date_match.group("fraction")
+    timezone_text = date_match.group("timezone")
+    if offset_minutes is not None:
+        timezone_text = format_exif_offset(offset_minutes)
 
-        target_offset_minutes = next(iter(possible_offsets))
-        offset_text = format_exif_offset(target_offset_minutes)
-        offset_tag_name = EXIF_DATE_OFFSET_TAGS[timestamp_tag_name]
-        targets = set(existing_offset_targets.get(offset_tag_name, set()))
-        # These tags are standardized in ExifIFD. Create the standard field when
-        # absent and also update any existing duplicate EXIF location.
-        targets.add(f"ExifIFD:{offset_tag_name}")
-        for write_target in sorted(targets):
-            write_arguments.append(f"-{write_target}={offset_text}")
-            expected_offset_targets[write_target] = target_offset_minutes
+    formatted = (
+        f"{local_datetime.year:04d}{date_separator}"
+        f"{local_datetime.month:02d}{date_separator}"
+        f"{local_datetime.day:02d}{datetime_separator}"
+        f"{local_datetime.hour:02d}:{local_datetime.minute:02d}:"
+        f"{local_datetime.second:02d}"
+    )
+    if fraction is not None:
+        formatted += f".{fraction}"
+    if timezone_text is not None:
+        formatted += timezone_text
+    return formatted
 
-    write_arguments.append(str(filename))
+
+def format_date_only(original_value, local_datetime):
+    """Preserve the date separator of a date-only metadata value."""
+    original_text = str(original_value).strip()
+    date_match = DATE_ONLY_PATTERN.fullmatch(original_text)
+    if date_match is None:
+        raise ValueError(f"not a date-only value: {original_value!r}")
+    separator = original_text[4]
+    return (
+        f"{local_datetime.year:04d}{separator}"
+        f"{local_datetime.month:02d}{separator}"
+        f"{local_datetime.day:02d}"
+    )
+
+
+def format_time_only(original_value, local_datetime, offset_minutes=None):
+    """Preserve fractional precision while formatting a time-only value."""
+    original_text = str(original_value).strip()
+    time_match = TIME_ONLY_PATTERN.fullmatch(original_text)
+    if time_match is None:
+        raise ValueError(f"not a time-only value: {original_value!r}")
+    formatted = (
+        f"{local_datetime.hour:02d}:{local_datetime.minute:02d}:"
+        f"{local_datetime.second:02d}"
+    )
+    fraction = time_match.group("fraction")
+    if fraction is not None:
+        formatted += f".{fraction}"
+    timezone_text = time_match.group("timezone")
+    if offset_minutes is not None:
+        timezone_text = format_exif_offset(offset_minutes)
+    if timezone_text is not None:
+        formatted += timezone_text
+    return formatted
+
+
+def parse_partial_datetime(date_value, time_value):
+    """Combine matching date-only and time-only fields for safe correction."""
+    date_match = DATE_ONLY_PATTERN.fullmatch(str(date_value).strip())
+    time_match = TIME_ONLY_PATTERN.fullmatch(str(time_value).strip())
+    if date_match is None or time_match is None:
+        return None
+    local_datetime = datetime(
+        int(date_match.group("year")),
+        int(date_match.group("month")),
+        int(date_match.group("day")),
+        int(time_match.group("hour")),
+        int(time_match.group("minute")),
+        int(time_match.group("second")),
+    )
+    offset_minutes = parse_timezone_offset_minutes(time_match.group("timezone"))
+    return local_datetime, offset_minutes
+
+
+def normalize_target(target):
+    """Remove ExifTool's raw-value suffix for read-back comparisons."""
+    return target[:-1] if target.endswith("#") else target
+
+
+def read_correction_metadata(metadata_reader, filename):
+    """Read all existing date/time and timezone fields used by correction."""
     try:
-        metadata_reader.execute(*write_arguments)
+        metadata_results = metadata_reader.get_tags(
+            files=filename,
+            tags=CORRECTION_READ_TAGS,
+            params=CORRECTION_READ_PARAMS,
+        )
     except ExifToolException as error:
         raise OSError(
-            f"ExifTool could not update corrected EXIF metadata in "
-            f"'{filename}': {error}"
+            f"ExifTool could not inspect correction fields in '{filename}': "
+            f"{error}"
         ) from error
+    return metadata_results[0] if metadata_results else {}
 
-    (
-        timestamps_after,
-        offsets_after,
-        _,
-    ) = read_exif_correction_state(metadata_reader, filename)
 
-    verification_errors = []
-    for write_target, old_values in timestamps_before.items():
-        expected_values = sorted(
-            old_value + correction_delta for old_value in old_values
+def add_correction_operation(operations, skipped, operation):
+    """Add one absolute write, rejecting ambiguous duplicate target values."""
+    target_key = normalize_target(operation["target"])
+    existing = operations.get(target_key)
+    if existing is None:
+        operations[target_key] = operation
+        return
+    if (
+        existing["value"] == operation["value"]
+        and existing["kind"] == operation["kind"]
+        and existing["expected"] == operation["expected"]
+    ):
+        return
+    operations.pop(target_key, None)
+    skipped.add(f"{target_key} (conflicting duplicate values)")
+
+
+def format_context_offset_value(tag_name, original_value, offset_minutes):
+    """Preserve a standalone offset field's representation where practical."""
+    if tag_name == "TimeZoneOffset" and isinstance(original_value, (int, float)):
+        numeric_hours = offset_minutes / 60
+        return str(int(numeric_hours)) if numeric_hours.is_integer() else str(numeric_hours)
+
+    original_text = str(original_value).strip()
+    replacement = format_exif_offset(offset_minutes)
+    if SIGNED_OFFSET_PATTERN.search(original_text):
+        return SIGNED_OFFSET_PATTERN.sub(replacement, original_text, count=1)
+    return replacement
+
+
+def raw_dst_write_value(groups, original_value, expected_dst):
+    """Preserve maker encodings when known, with Canon's 60-minute ON value."""
+    if not expected_dst:
+        return "0"
+    try:
+        numeric_value = int(float(str(original_value).strip()))
+    except ValueError:
+        numeric_value = 0
+    if numeric_value:
+        return str(numeric_value)
+    if any(group_name.casefold().startswith("canon") for group_name in groups):
+        return "60"
+    return "1"
+
+
+def operation_matches(operation, actual_values):
+    """Compare read-back values semantically instead of by formatting alone."""
+    kind = operation["kind"]
+    expected = operation["expected"]
+    for actual_value in actual_values:
+        try:
+            if kind == "datetime":
+                parsed = parse_complete_metadata_datetime(actual_value)
+                if parsed == expected:
+                    return True
+            elif kind == "date":
+                match = DATE_ONLY_PATTERN.fullmatch(str(actual_value).strip())
+                if match is not None and (
+                    int(match.group("year")),
+                    int(match.group("month")),
+                    int(match.group("day")),
+                ) == expected:
+                    return True
+            elif kind == "time":
+                match = TIME_ONLY_PATTERN.fullmatch(str(actual_value).strip())
+                if match is not None:
+                    actual_time = (
+                        int(match.group("hour")),
+                        int(match.group("minute")),
+                        int(match.group("second")),
+                        parse_timezone_offset_minutes(match.group("timezone")),
+                    )
+                    if actual_time == expected:
+                        return True
+            elif kind == "offset":
+                if parse_context_offset(operation["tag_name"], actual_value) == expected:
+                    return True
+            elif kind == "dst":
+                if parse_daylight_savings_value(actual_value) == expected:
+                    return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def build_correction_operations(
+    source_metadata,
+    correction_delta,
+    selected_corrected_datetime,
+    classification_timezone,
+):
+    """Build absolute writes for local times, offsets, and writable DST flags."""
+    operations = {}
+    skipped = set()
+    records = list(iter_metadata_values(source_metadata))
+
+    records_by_family_tag = {}
+    values_by_tag = {}
+    for metadata_key, groups, tag_name, raw_value in records:
+        family_key = tuple(
+            group_name
+            for group_name in groups
+            if not group_name.casefold().startswith("copy")
         )
-        actual_values = sorted(timestamps_after.get(write_target, []))
-        if actual_values != expected_values:
-            verification_errors.append(
-                f"{write_target}={actual_values!r}, expected "
-                f"{expected_values!r}"
-            )
+        records_by_family_tag.setdefault((family_key, tag_name), []).append(
+            (metadata_key, groups, raw_value)
+        )
+        values_by_tag.setdefault(tag_name, []).append(
+            (metadata_key, groups, raw_value)
+        )
 
-    for write_target, expected_offset in expected_offset_targets.items():
-        actual_offsets = offsets_after.get(write_target, [])
-        if not actual_offsets or any(
-            actual_offset != expected_offset
-            for actual_offset in actual_offsets
+    offset_presence = {
+        (family_key[0] if family_key else "", tag_name)
+        for (family_key, tag_name), tag_records in records_by_family_tag.items()
+        if tag_records and tag_name in set(ASSOCIATED_OFFSET_TAGS.values())
+    }
+    corrected_local_values = {}
+
+    for metadata_key, groups, tag_name, raw_value in records:
+        if (
+            tag_name in TIME_CONTEXT_TAGS
+            or tag_name in UTC_REFERENCE_TAGS
+            or tag_name in NONLOCAL_CORRECTION_TAGS
+            or tag_name in {"FileCreateDate", "FileModifyDate", "FileAccessDate"}
+            or not groups
+            or groups[0] == "Composite"
         ):
-            verification_errors.append(
-                f"{write_target}={actual_offsets!r}, expected "
-                f"{format_exif_offset(expected_offset)!r}"
-            )
+            continue
 
-    if verification_errors:
-        raise OSError(
-            "ExifTool verification failed after writing corrected metadata: "
-            + "; ".join(verification_errors)
+        try:
+            parsed = parse_complete_metadata_datetime(raw_value)
+        except ValueError:
+            skipped.add(f"{metadata_key} (invalid timestamp)")
+            continue
+        if parsed is None:
+            continue
+
+        local_datetime, inline_offset = parsed
+        family_zero = groups[0]
+        associated_offset_tag = ASSOCIATED_OFFSET_TAGS.get(tag_name)
+        has_separate_offset = (
+            associated_offset_tag is not None
+            and (family_zero, associated_offset_tag) in offset_presence
+        )
+        write_target = get_metadata_write_target(groups, tag_name)
+        if write_target is None:
+            continue
+
+        if inline_offset is not None:
+            expected_offset = get_unambiguous_timezone_offset(
+                local_datetime,
+                classification_timezone,
+            )
+            if expected_offset is None:
+                skipped.add(f"{metadata_key} (ambiguous corrected offset)")
+                continue
+            expected_local = local_datetime
+            expected_text = format_complete_datetime(
+                raw_value,
+                expected_local,
+                expected_offset,
+            )
+            expected = (expected_local, expected_offset)
+        elif has_separate_offset:
+            expected_local = local_datetime
+            corrected_local_values.setdefault(
+                (family_zero, tag_name),
+                [],
+            ).append(expected_local)
+            continue
+        else:
+            expected_local = local_datetime + correction_delta
+            expected_text = format_complete_datetime(raw_value, expected_local)
+            expected = (expected_local, None)
+
+        corrected_local_values.setdefault(
+            (family_zero, tag_name),
+            [],
+        ).append(expected_local)
+        add_correction_operation(
+            operations,
+            skipped,
+            {
+                "target": write_target,
+                "value": expected_text,
+                "kind": "datetime",
+                "expected": expected,
+                "tag_name": tag_name,
+                "source": metadata_key,
+            },
         )
 
-    return sorted(timestamps_before)
+    # Correct paired IPTC-style date-only/time-only values without inventing a
+    # date for a time-only field or losing a midnight rollover.
+    for date_tag, time_tag in PARTIAL_DATE_TIME_PAIRS:
+        family_keys = {
+            family_key
+            for family_key, tag_name in records_by_family_tag
+            if tag_name in {date_tag, time_tag}
+        }
+        for family_key in family_keys:
+            date_records = records_by_family_tag.get((family_key, date_tag), [])
+            time_records = records_by_family_tag.get((family_key, time_tag), [])
+            if len(date_records) != 1 or len(time_records) != 1:
+                continue
+            date_key, date_groups, date_value = date_records[0]
+            time_key, time_groups, time_value = time_records[0]
+            try:
+                parsed_pair = parse_partial_datetime(date_value, time_value)
+            except ValueError:
+                parsed_pair = None
+            if parsed_pair is None:
+                continue
+            local_datetime, inline_offset = parsed_pair
+            if inline_offset is None:
+                expected_local = local_datetime + correction_delta
+                expected_offset = None
+            else:
+                expected_local = local_datetime
+                expected_offset = get_unambiguous_timezone_offset(
+                    local_datetime,
+                    classification_timezone,
+                )
+                if expected_offset is None:
+                    skipped.add(f"{time_key} (ambiguous corrected offset)")
+                    continue
+
+            date_target = get_metadata_write_target(date_groups, date_tag)
+            time_target = get_metadata_write_target(time_groups, time_tag)
+            if date_target is not None:
+                add_correction_operation(
+                    operations,
+                    skipped,
+                    {
+                        "target": date_target,
+                        "value": format_date_only(date_value, expected_local),
+                        "kind": "date",
+                        "expected": (
+                            expected_local.year,
+                            expected_local.month,
+                            expected_local.day,
+                        ),
+                        "tag_name": date_tag,
+                        "source": date_key,
+                    },
+                )
+            if time_target is not None:
+                add_correction_operation(
+                    operations,
+                    skipped,
+                    {
+                        "target": time_target,
+                        "value": format_time_only(
+                            time_value,
+                            expected_local,
+                            expected_offset,
+                        ),
+                        "kind": "time",
+                        "expected": (
+                            expected_local.hour,
+                            expected_local.minute,
+                            expected_local.second,
+                            expected_offset,
+                        ),
+                        "tag_name": time_tag,
+                        "source": time_key,
+                    },
+                )
+
+    # Update existing standalone offset fields. Standard OffsetTime* fields use
+    # their associated timestamp when available; general camera offsets use the
+    # selected corrected group time.
+    inverse_offset_tags = {
+        offset_tag: date_tag
+        for date_tag, offset_tag in ASSOCIATED_OFFSET_TAGS.items()
+    }
+    for tag_name in OFFSET_CONTEXT_TAGS:
+        for metadata_key, groups, raw_value in values_by_tag.get(tag_name, []):
+            family_zero = groups[0] if groups else ""
+            reference_values = corrected_local_values.get(
+                (family_zero, inverse_offset_tags.get(tag_name)),
+                [],
+            )
+            unique_reference_values = set(reference_values)
+            reference_datetime = (
+                next(iter(unique_reference_values))
+                if len(unique_reference_values) == 1
+                else selected_corrected_datetime
+            )
+            expected_offset = get_unambiguous_timezone_offset(
+                reference_datetime,
+                classification_timezone,
+            )
+            if expected_offset is None:
+                skipped.add(f"{metadata_key} (ambiguous corrected offset)")
+                continue
+            write_target = get_metadata_write_target(
+                groups,
+                tag_name,
+                raw=(tag_name == "TimeZoneOffset" and isinstance(raw_value, (int, float))),
+            )
+            if write_target is None:
+                continue
+            add_correction_operation(
+                operations,
+                skipped,
+                {
+                    "target": write_target,
+                    "value": format_context_offset_value(
+                        tag_name,
+                        raw_value,
+                        expected_offset,
+                    ),
+                    "kind": "offset",
+                    "expected": expected_offset,
+                    "tag_name": tag_name,
+                    "source": metadata_key,
+                },
+            )
+
+    expected_state = get_unambiguous_timezone_state(
+        selected_corrected_datetime,
+        classification_timezone,
+    )
+    if expected_state is not None:
+        expected_dst = expected_state[0]
+        active_profiles = {
+            parse_world_time_location(raw_value)
+            for _, _, raw_value in values_by_tag.get(PROFILE_SELECTOR_TAG, [])
+        }
+        active_profiles.discard(None)
+        active_profile_tag = None
+        if len(active_profiles) == 1:
+            active_profile_tag = PROFILE_DST_TAGS[next(iter(active_profiles))]
+
+        dst_tag_names = set(DIRECT_DST_TAGS)
+        if active_profile_tag is not None:
+            dst_tag_names.add(active_profile_tag)
+        for tag_name in dst_tag_names:
+            for metadata_key, groups, raw_value in values_by_tag.get(tag_name, []):
+                write_target = get_metadata_write_target(
+                    groups,
+                    tag_name,
+                    raw=True,
+                )
+                if write_target is None:
+                    continue
+                add_correction_operation(
+                    operations,
+                    skipped,
+                    {
+                        "target": write_target,
+                        "value": raw_dst_write_value(
+                            groups,
+                            raw_value,
+                            expected_dst,
+                        ),
+                        "kind": "dst",
+                        "expected": expected_dst,
+                        "tag_name": tag_name,
+                        "source": metadata_key,
+                    },
+                )
+
+    # FileCreateDate is shifted when the platform exposes and permits it. The
+    # cross-platform FileModifyDate fallback is handled with os.utime below.
+    for metadata_key, groups, tag_name, raw_value in records:
+        if tag_name != "FileCreateDate":
+            continue
+        try:
+            parsed = parse_complete_metadata_datetime(raw_value)
+        except ValueError:
+            parsed = None
+        if parsed is None:
+            continue
+        local_datetime, _ = parsed
+        expected_local = local_datetime + correction_delta
+        expected_offset = get_unambiguous_timezone_offset(
+            expected_local,
+            classification_timezone,
+        )
+        expected_text = format_complete_datetime(
+            raw_value,
+            expected_local,
+            expected_offset,
+        )
+        add_correction_operation(
+            operations,
+            skipped,
+            {
+                "target": "FileCreateDate",
+                "value": expected_text,
+                "kind": "datetime",
+                "expected": (expected_local, expected_offset),
+                "tag_name": tag_name,
+                "source": metadata_key,
+            },
+        )
+
+    return list(operations.values()), skipped
+
+
+def execute_correction_operations(metadata_reader, filename, operations):
+    """Write all supported operations, then verify them by reading the copy."""
+    skipped = set()
+    if operations:
+        write_arguments = list(CORRECTION_WRITE_PARAMS)
+        write_arguments.extend(
+            f"-{operation['target']}={operation['value']}"
+            for operation in operations
+        )
+        write_arguments.append(str(filename))
+        try:
+            metadata_reader.execute(*write_arguments)
+        except ExifToolException:
+            # A file may contain a mixture of writable and read-only tags. Retry
+            # individually so unsupported maker-note fields do not block common
+            # EXIF/XMP fields that ExifTool can safely write.
+            for operation in operations:
+                try:
+                    metadata_reader.execute(
+                        *CORRECTION_WRITE_PARAMS,
+                        f"-{operation['target']}={operation['value']}",
+                        str(filename),
+                    )
+                except ExifToolException as error:
+                    skipped.add(
+                        f"{normalize_target(operation['target'])} ({error})"
+                    )
+
+    destination_metadata = read_correction_metadata(metadata_reader, filename)
+    actual_by_target = {}
+    for _, groups, tag_name, raw_value in iter_metadata_values(
+        destination_metadata
+    ):
+        target = get_metadata_write_target(groups, tag_name)
+        if target is not None:
+            actual_by_target.setdefault(target, []).append(raw_value)
+        elif tag_name == "FileCreateDate":
+            actual_by_target.setdefault("FileCreateDate", []).append(raw_value)
+
+    updated = []
+    for operation in operations:
+        target = normalize_target(operation["target"])
+        if operation_matches(operation, actual_by_target.get(target, [])):
+            updated.append(target)
+        else:
+            skipped.add(f"{target} (not writable or verification failed)")
+    return sorted(set(updated)), sorted(skipped)
+
+
+def update_corrected_copy_metadata(
+    metadata_reader,
+    source_file,
+    destination_file,
+    correction_delta,
+    selected_corrected_datetime,
+    classification_timezone,
+):
+    """Correct writable metadata and system fallback times in a classified copy."""
+    source_metadata = read_correction_metadata(metadata_reader, source_file)
+    operations, plan_skipped = build_correction_operations(
+        source_metadata,
+        correction_delta,
+        selected_corrected_datetime,
+        classification_timezone,
+    )
+    updated, write_skipped = execute_correction_operations(
+        metadata_reader,
+        destination_file,
+        operations,
+    )
+
+    # FileModifyDate is the cross-platform system fallback. Set it from the
+    # source baseline plus the approved correction so repeated runs are
+    # idempotent and never add the correction twice.
+    source_stat = source_file.stat()
+    corrected_mtime_ns = source_stat.st_mtime_ns + int(
+        correction_delta.total_seconds() * 1_000_000_000
+    )
+    destination_stat = destination_file.stat()
+    os.utime(
+        destination_file,
+        ns=(destination_stat.st_atime_ns, corrected_mtime_ns),
+    )
+    if destination_file.stat().st_mtime_ns != corrected_mtime_ns:
+        raise OSError(
+            f"could not verify corrected FileModifyDate for '{destination_file}'"
+        )
+    updated.append("FileModifyDate")
+    return sorted(set(updated)), sorted(set(plan_skipped) | set(write_skipped))
 
 
 def format_records_by_file(records):
@@ -1206,12 +1630,12 @@ def get_dates(metadata_reader, filename):
 
 
 def get_file_modify_date(metadata_reader, filename):
-    """Return the separately requested FileModifyDate fallback candidate."""
+    """Return raw FileModifyDate as the separately requested fallback."""
     try:
         metadata_results = metadata_reader.get_tags(
             files=filename,
             tags=FILE_MODIFY_DATE_TAGS,
-            params=FILE_MODIFY_DATE_PARAMS,
+            params=[],
         )
     except ExifToolException as error:
         raise OSError(
@@ -1230,20 +1654,22 @@ def get_file_modify_date(metadata_reader, filename):
         return None, "ExifTool returned no FileModifyDate"
 
     try:
-        modification_date = datetime.strptime(
-            str(modification_date_text),
-            EXIF_DATE_FORMAT,
+        parsed_modification_date = parse_complete_metadata_datetime(
+            modification_date_text
         )
     except ValueError as error:
         return None, (
             f"invalid FileModifyDate {modification_date_text!r} ({error})"
         )
+    if parsed_modification_date is None:
+        return None, f"incomplete FileModifyDate {modification_date_text!r}"
 
+    modification_date, timezone_offset_minutes = parsed_modification_date
     return (
         0,
         modification_date,
         "File:System:FileModifyDate",
-        None,
+        timezone_offset_minutes,
     ), None
 
 
@@ -1368,60 +1794,82 @@ def copy_file_safely(source_file, requested_destination):
         return destination_file, True, suffix_number > 0
 
 
-def copy_file_with_corrected_exif(
+def find_previous_corrected_duplicate(destination_file, requested_destination):
+    """Find an earlier collision candidate identical to a corrected new copy."""
+    suffix_number = 0
+    while True:
+        candidate = (
+            requested_destination
+            if suffix_number == 0
+            else requested_destination.with_name(
+                f"{requested_destination.stem}_{suffix_number}"
+                f"{requested_destination.suffix}"
+            )
+        )
+        if candidate == destination_file:
+            return None
+        if candidate.is_file() and files_are_binary_identical(
+            destination_file,
+            candidate,
+        ):
+            return candidate
+        suffix_number += 1
+
+
+def copy_file_with_corrected_metadata(
     metadata_reader,
     source_file,
     requested_destination,
     correction_delta,
+    selected_corrected_datetime,
     classification_timezone,
 ):
-    """
-    Build and verify a corrected temporary copy before collision-safe placement.
-
-    Metadata is never written to the source. Duplicate comparison uses the final
-    corrected bytes, allowing repeated runs to recognize an existing corrected
-    output rather than creating another numbered copy.
-    """
-    temporary_file = None
+    """Copy first, then correct and verify the classified copy in place."""
+    destination_file, copied, renamed = copy_file_safely(
+        source_file,
+        requested_destination,
+    )
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            prefix=".reclassify_",
-            suffix=source_file.suffix,
-            dir=requested_destination.parent,
-            delete=False,
-        ) as temporary_stream:
-            temporary_file = Path(temporary_stream.name)
-            with source_file.open("rb") as source_stream:
-                shutil.copyfileobj(
-                    source_stream,
-                    temporary_stream,
-                    length=COPY_CHUNK_SIZE,
-                )
-
-        shutil.copystat(source_file, temporary_file)
-        updated_targets = update_corrected_exif_metadata(
+        updated_targets, skipped_targets = update_corrected_copy_metadata(
             metadata_reader,
-            temporary_file,
+            source_file,
+            destination_file,
             correction_delta,
+            selected_corrected_datetime,
             classification_timezone,
         )
-        # ExifTool may rewrite the temporary file. Restore the source copy's
-        # filesystem attributes after metadata verification.
-        shutil.copystat(source_file, temporary_file)
-
-        destination_file, copied, renamed = copy_file_safely(
-            temporary_file,
-            requested_destination,
-        )
-        return destination_file, copied, renamed, updated_targets
-
-    finally:
-        if temporary_file is not None:
+    except OSError:
+        if copied:
             try:
-                temporary_file.unlink(missing_ok=True)
+                destination_file.unlink(missing_ok=True)
             except OSError:
                 pass
+        raise
+
+    if copied:
+        previous_duplicate = find_previous_corrected_duplicate(
+            destination_file,
+            requested_destination,
+        )
+        if previous_duplicate is not None:
+            destination_file.unlink()
+            return (
+                previous_duplicate,
+                False,
+                previous_duplicate != requested_destination,
+                updated_targets,
+                skipped_targets,
+                True,
+            )
+
+    return (
+        destination_file,
+        copied,
+        renamed,
+        updated_targets,
+        skipped_targets,
+        False,
+    )
 
 
 # Request the source directory and intentionally process only regular files
@@ -1484,14 +1932,13 @@ duplicate_count = 0
 renamed_count = 0
 review_count = 0
 failed_count = 0
-exif_updated_count = 0
-exif_absent_count = 0
+metadata_updated_count = 0
+metadata_skipped_count = 0
 
 try:
     for base_stem, same_stem_files in same_stem_groups:
         file_dates = {}
         usable_files = set()
-        image_files = set()
         base_image_files = []
         base_capture_files = []
         context_records_by_file = {}
@@ -1529,8 +1976,6 @@ try:
                 continue
 
             usable_files.add(same_stem_file)
-            if file_is_image:
-                image_files.add(same_stem_file)
             if context_records:
                 context_records_by_file[same_stem_file] = context_records
             if utc_records:
@@ -1672,7 +2117,6 @@ try:
 
         if (
             selected_file_date is not None
-            and selected_file_date[0] == 1
             and selected_date_option is not None
         ):
             uncorrected_datetime = selected_file_date[1]
@@ -1716,29 +2160,33 @@ try:
                 failed_count += 1
                 continue
 
-            updated_exif_targets = []
-            corrected_image_copy = (
+            updated_metadata_targets = []
+            skipped_metadata_targets = []
+            corrected_copy = (
                 timezone_correction_delta is not None
                 and same_stem_file not in review_reasons
-                and same_stem_file in image_files
             )
+            already_corrected = False
 
             try:
                 destination_directory.mkdir(parents=True, exist_ok=True)
                 requested_destination = (
                     destination_directory / same_stem_file.name
                 )
-                if corrected_image_copy:
+                if corrected_copy:
                     (
                         destination_file,
                         copied,
                         renamed,
-                        updated_exif_targets,
-                    ) = copy_file_with_corrected_exif(
+                        updated_metadata_targets,
+                        skipped_metadata_targets,
+                        already_corrected,
+                    ) = copy_file_with_corrected_metadata(
                         metadata_reader,
                         same_stem_file,
                         requested_destination,
                         timezone_correction_delta,
+                        selected_file_date[1],
                         classification_timezone,
                     )
                 else:
@@ -1756,7 +2204,7 @@ try:
                 continue
 
             print(
-                f"{same_stem_file.name}\t--->\t{folder_name}\t",
+                f"{same_stem_file.name}	--->	{folder_name}	",
                 end="",
             )
             if copied:
@@ -1773,22 +2221,23 @@ try:
                     end="",
                 )
 
-            if corrected_image_copy:
-                if updated_exif_targets:
-                    if copied:
-                        exif_updated_count += 1
-                        print(
-                            "; EXIF UPDATED: "
-                            + ", ".join(updated_exif_targets),
-                            end="",
-                        )
-                    else:
-                        print("; EXIF ALREADY CORRECTED", end="")
-                else:
-                    if copied:
-                        exif_absent_count += 1
+            if corrected_copy:
+                if copied:
+                    metadata_updated_count += 1
+                if skipped_metadata_targets:
+                    metadata_skipped_count += 1
+                if already_corrected:
+                    print("; METADATA ALREADY CORRECTED", end="")
+                elif updated_metadata_targets:
                     print(
-                        "; NO EXISTING COMMON EXIF DATE FIELDS",
+                        "; METADATA UPDATED: "
+                        + ", ".join(updated_metadata_targets),
+                        end="",
+                    )
+                if skipped_metadata_targets:
+                    print(
+                        "; NOT WRITABLE/SKIPPED: "
+                        + ", ".join(skipped_metadata_targets),
                         end="",
                     )
 
@@ -1817,11 +2266,8 @@ print(f"Binary duplicates: {duplicate_count}")
 print(f"Renamed collision copies: {renamed_count}")
 print(f"Files sent for review: {review_count}")
 print(f"Failed files: {failed_count}")
-print(f"Copies with corrected EXIF timestamps: {exif_updated_count}")
-print(
-    "Corrected image copies without common EXIF date fields: "
-    f"{exif_absent_count}"
-)
+print(f"Copies with corrected metadata/system time: {metadata_updated_count}")
+print(f"Corrected copies with skipped read-only fields: {metadata_skipped_count}")
 print("Original source files were not modified.")
 
 input("Press Enter to exit")
