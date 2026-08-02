@@ -70,6 +70,21 @@ The default timezone alone is an assumption and never proves that the camera clo
 
 A corrected classification value is reported as `METADATA_TIMEZONE_CORRECTED`.
 
+### Reusing an approved correction during one run
+
+After a timezone or daylight-saving correction is accepted, the script asks whether the same correction should be applied automatically to later groups with the same mismatch during the current run:
+
+```text
+Automatically apply this same correction to all later groups with the
+same daylight-saving/offset mismatch during this run? [y/N]:
+```
+
+Selecting `y` creates a session-only approval. A later group is corrected automatically only when its evidence matches the accepted case exactly: the correction amount, recorded DST state, expected DST state, observed UTC offsets, and expected UTC offsets must all be the same. Manufacturer names, filenames, and individual metadata source paths are not part of the match, so equivalent evidence from different camera brands can share one approval.
+
+Different correction amounts, opposite winter/summer errors, different offset evidence, ambiguous transition times, or otherwise non-equivalent cases still require a separate decision. The approval is kept only in memory and is cleared when the script exits.
+
+Automatically approved groups use the same correction pipeline as manually approved groups. Their classified copies receive the applicable local timestamp, offset, writable DST-setting, and filesystem-fallback updates described below.
+
 ### Metadata updates in corrected copies
 
 When the user accepts a timezone or daylight-saving correction, the script first creates the normal collision-safe copy in `classified` and then edits that copy in place. No separate application-level temporary copy is built, and the original source file remains untouched. ExifTool may still use its own internal safe-write mechanism while replacing metadata.
