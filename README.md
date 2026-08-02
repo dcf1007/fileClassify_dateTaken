@@ -38,6 +38,8 @@ These cover camera/device operation, metadata history, resource modification, re
 
 The embedded pass preserves ExifTool's raw date/time values instead of applying a global output format. This prevents partial IPTC fields from becoming artificial full timestamps: `IPTC:DateCreated` remains date-only, `IPTC:TimeCreated` remains time-only, and neither is offered independently. Composite fields such as `Composite:DateTimeCreated`, which genuinely combine the date and time components, remain eligible. Fractional seconds and timezone suffixes on complete timestamps are accepted.
 
+The parser defines one-second resolution as the canonical classification precision. This is applied while the raw timestamp is parsed, before candidates are grouped or displayed. A whole-second EXIF value such as `2024:09:14 00:40:47` and a higher-precision XMP or Composite value such as `2024-09-14T00:40:47.37` therefore represent one classification timestamp rather than two visually identical choices.
+
 The remaining timestamps may come from EXIF, XMP, IPTC, QuickTime, maker notes, composite tags, and other metadata families supported by ExifTool. `-G0:1:4` preserves the metadata type, exact storage location, and duplicate instance number.
 
 When distinct complete embedded timestamps are found anywhere in a related group, the script lists their full ExifTool source paths and asks the user to choose one. Each filename is displayed once per option, followed by all matching fields for that file. Duplicate occurrences of the same field are collapsed.
