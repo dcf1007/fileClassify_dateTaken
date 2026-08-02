@@ -3,35 +3,68 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-import PIL.Image
-from PIL import UnidentifiedImageError
+from exiftool import ExifToolHelper
+from exiftool.exceptions import ExifToolException, ExifToolExecuteError
 
-
-# Preserve the original support for very large RAW-derived images and panoramas.
-# This setting will be reviewed later with the metadata modernization.
-PIL.Image.MAX_IMAGE_PIXELS = None
-PIL.Image.init()
 
 DATETYPE = {0: "OS_DATE", 1: "EXIF"}
 
-# These are the three standard EXIF date fields commonly found in older
-# cameras and image-editing software. DateTimeOriginal normally describes when
-# the picture was taken, DateTimeDigitized describes when it became digital,
-# and DateTime describes when the image metadata was last changed. Until the
-# later ExifTool modernization, these are the date fields available through the
-# current Pillow-based reader.
+# Keep the same three EXIF date fields that the Pillow-based version checked.
+# ExifTool uses CreateDate for EXIF tag 0x9004 (DateTimeDigitized) and
+# ModifyDate for EXIF tag 0x0132 (DateTime).
 EXIF_DATE_TAGS = {
-    36867: "DateTimeOriginal",
-    36868: "DateTimeDigitized",
-    306: "DateTime",
+    "DateTimeOriginal": "DateTimeOriginal",
+    "CreateDate": "DateTimeDigitized",
+    "ModifyDate": "DateTime",
 }
+
+# Only the existing date fields and the small amount of file-status metadata
+# needed to replace Pillow's image inspection are requested. Broader ExifTool
+# date discovery is intentionally deferred to a later update.
+EXIFTOOL_TAGS = [
+    "EXIF:DateTimeOriginal",
+    "EXIF:CreateDate",
+    "EXIF:ModifyDate",
+    "File:FileType",
+    "File:MIMEType",
+    "ExifTool:Validate",
+    "ExifTool:Warning",
+    "ExifTool:Error",
+]
+
 EXIF_DATE_FORMAT = "%Y:%m:%d %H:%M:%S"
 CLASSIFIED_FOLDER_NAME = "classified"
 UNCLASSIFIED_FOLDER_NAME = "unclassified"
 COPY_CHUNK_SIZE = 1024 * 1024
+
+# This list is used only when ExifTool cannot identify a damaged file at all.
+# It replaces Pillow's registered-extension check so that an unreadable file
+# with an image extension is still sent to the unclassified directory.
 IMAGE_EXTENSIONS = {
-    extension.casefold()
-    for extension in PIL.Image.registered_extensions()
+    ".arw",
+    ".avif",
+    ".bmp",
+    ".cr2",
+    ".cr3",
+    ".dng",
+    ".gif",
+    ".heic",
+    ".heif",
+    ".jpe",
+    ".jpeg",
+    ".jpg",
+    ".nef",
+    ".nrw",
+    ".orf",
+    ".pef",
+    ".png",
+    ".raf",
+    ".rw2",
+    ".sr2",
+    ".srf",
+    ".tif",
+    ".tiff",
+    ".webp",
 }
 
 
@@ -47,7 +80,82 @@ def clean_input_path(raw_path):
     return Path(cleaned_path).expanduser()
 
 
-def get_dates(filename):
+def get_metadata_values(metadata, tag_name):
+    """
+    Return all values whose ExifTool key ends with the requested tag name.
+
+    ExifTool is started with group-family-1 names, so keys normally look like
+    ExifIFD:DateTimeOriginal, IFD0:ModifyDate, File:MIMEType, or
+    ExifTool:Warning. Looking at the final component keeps this function small
+    while the requested tag list still limits extraction to the intended EXIF
+    fields.
+    """
+    values = []
+
+    for metadata_key, metadata_value in metadata.items():
+        if metadata_key.rsplit(":", 1)[-1] != tag_name:
+            continue
+
+        if isinstance(metadata_value, list):
+            values.extend(metadata_value)
+        else:
+            values.append(metadata_value)
+
+    return [value for value in values if value is not None]
+
+
+def get_first_metadata_value(metadata, tag_name):
+    """Return the first value for a requested ExifTool tag, or None."""
+    values = get_metadata_values(metadata, tag_name)
+    return values[0] if values else None
+
+
+def validation_reports_errors(validation_value):
+    """
+    Return True when ExifTool's Validate value reports at least one error.
+
+    With numeric print conversion disabled, Validate commonly returns three
+    numbers: errors, warnings, and minor warnings. The text fallback covers a
+    human-readable value if ExifTool returns one instead.
+    """
+    if validation_value is None:
+        return False
+
+    validation_text = str(validation_value).strip()
+    validation_parts = validation_text.split()
+
+    if validation_parts:
+        try:
+            return int(validation_parts[0]) > 0
+        except ValueError:
+            pass
+
+    lowered_text = validation_text.casefold()
+    return "error" in lowered_text and not lowered_text.startswith("0 error")
+
+
+def is_image_file(filename, metadata):
+    """
+    Decide whether a file should be treated as an image for review handling.
+
+    ExifTool's MIME type is preferred. The extension list is a fallback for a
+    damaged image that ExifTool cannot identify from its contents.
+    """
+    mime_type = get_first_metadata_value(metadata, "MIMEType")
+
+    if isinstance(mime_type, str) and mime_type.casefold().startswith("image/"):
+        return True
+
+    return filename.suffix.casefold() in IMAGE_EXTENSIONS
+
+
+def modification_date_candidate(filename):
+    """Return the original script's filesystem modification-time fallback."""
+    modification_date = datetime.fromtimestamp(filename.stat().st_mtime)
+    return [(0, modification_date, DATETYPE[0])], None
+
+
+def get_dates(metadata_reader, filename):
     """
     Return (date_candidates, review_reason).
 
@@ -55,120 +163,96 @@ def get_dates(filename):
 
         (date_type, date_value, source_name)
 
-    A single file may contain several EXIF date fields. All valid values are
-    returned so the main processing loop can detect a disagreement within one
-    file in exactly the same way as a disagreement between related files.
+    This is a direct replacement for the Pillow-based reader. It deliberately
+    keeps the same supported date fields and the same fallback behavior:
 
-    If no supported EXIF date exists, the filesystem modification time is used
-    as the original script's fallback. The modification time is not added when
-    EXIF dates are present, because it remains a last resort rather than an
-    equal alternative to embedded metadata.
+        1. EXIF DateTimeOriginal, DateTimeDigitized, and DateTime
+        2. filesystem modification time when none of those fields exists
 
-    A damaged image, unreadable metadata, or any present EXIF date that cannot
-    be parsed returns a review reason. Such a file is copied to unclassified
-    rather than classified using a timestamp that may be unreliable.
+    A file may contain several EXIF date fields. All valid values are returned
+    so the existing conflict prompt can handle disagreements within one file or
+    between related files.
+
+    ExifTool's validation and error output replaces Pillow's image verification.
+    Serious image-reading or metadata-validation problems send the file to the
+    unclassified directory. Minor ExifTool warnings are not treated as damage.
     """
-    exif_date_values = {}
-
     try:
-        with PIL.Image.open(filename) as image:
-            # Keep the original JPEG-style EXIF access until the later
-            # metadata modernization changes this in isolation. The legacy
-            # dictionary is flattened, allowing the three supported EXIF date
-            # tags to be checked directly.
-            legacy_exif_reader = getattr(image, "_getexif", None)
-            if callable(legacy_exif_reader):
-                try:
-                    exif_data = legacy_exif_reader()
-                except (
-                    AttributeError,
-                    IndexError,
-                    KeyError,
-                    OSError,
-                    TypeError,
-                    ValueError,
-                ) as error:
-                    return [], f"could not read EXIF metadata ({error})"
-
-                if exif_data:
-                    for exif_tag, field_name in EXIF_DATE_TAGS.items():
-                        exif_date_text = exif_data.get(exif_tag)
-                        if exif_date_text is not None:
-                            exif_date_values[field_name] = exif_date_text
-
-            # Keep the original TIFF-specific fallback. Read only fields that
-            # were not already obtained through _getexif(), preventing the
-            # same physical field from being listed twice.
-            tiff_tags = getattr(image, "tag", None)
-            if tiff_tags is not None:
-                for exif_tag, field_name in EXIF_DATE_TAGS.items():
-                    if field_name in exif_date_values:
-                        continue
-
-                    try:
-                        exif_date_text = tiff_tags.get(exif_tag)
-                    except (
-                        AttributeError,
-                        IndexError,
-                        KeyError,
-                        OSError,
-                        TypeError,
-                        ValueError,
-                    ) as error:
-                        return [], f"could not read TIFF metadata ({error})"
-
-                    if exif_date_text is not None:
-                        exif_date_values[field_name] = exif_date_text
-
-            # An image that opens but fails verification is not trusted.
-            try:
-                image.verify()
-            except (OSError, SyntaxError, ValueError) as error:
-                return [], f"image verification failed ({error})"
-
-    except UnidentifiedImageError as error:
-        # Unknown non-image files retain the original modification-time
-        # fallback. A recognized image extension is routed for review.
+        metadata_results = metadata_reader.get_tags(
+            files=filename,
+            tags=EXIFTOOL_TAGS,
+            params=["-a"],
+        )
+    except ExifToolExecuteError as error:
+        # A command error for a known image means its metadata could not be
+        # trusted. Non-image files preserve the existing modification-time
+        # fallback because they were never expected to contain EXIF metadata.
         if filename.suffix.casefold() in IMAGE_EXTENSIONS:
-            return [], f"Pillow could not identify the image ({error})"
+            error_message = error.stderr.strip() or str(error)
+            return [], f"ExifTool could not inspect the image ({error_message})"
 
-        modification_date = datetime.fromtimestamp(filename.stat().st_mtime)
-        return [(0, modification_date, DATETYPE[0])], None
+        return modification_date_candidate(filename)
+    except ExifToolException as error:
+        # Other PyExifTool failures indicate a reader/process problem rather
+        # than bad metadata in one file, so let the caller report a failed file.
+        raise OSError(
+            f"ExifTool could not read metadata from '{filename}': {error}"
+        ) from error
 
-    except PermissionError as error:
-        raise OSError(f"cannot read '{filename}': {error}") from error
-
-    except (OSError, SyntaxError, ValueError) as error:
+    if not metadata_results:
         if filename.suffix.casefold() in IMAGE_EXTENSIONS:
-            return [], f"could not inspect image metadata ({error})"
+            return [], "ExifTool returned no metadata for the image"
 
-        modification_date = datetime.fromtimestamp(filename.stat().st_mtime)
-        return [(0, modification_date, DATETYPE[0])], None
+        return modification_date_candidate(filename)
+
+    metadata = metadata_results[0]
+    file_is_image = is_image_file(filename, metadata)
+
+    error_messages = [
+        str(message).strip()
+        for message in get_metadata_values(metadata, "Error")
+        if str(message).strip()
+    ]
+    warning_messages = [
+        str(message).strip()
+        for message in get_metadata_values(metadata, "Warning")
+        if str(message).strip()
+    ]
+    serious_warning_messages = [
+        message
+        for message in warning_messages
+        if "[minor]" not in message.casefold()
+    ]
+    validation_value = get_first_metadata_value(metadata, "Validate")
+
+    if file_is_image and (
+        error_messages
+        or serious_warning_messages
+        or validation_reports_errors(validation_value)
+    ):
+        problem_messages = error_messages + serious_warning_messages
+
+        if validation_reports_errors(validation_value):
+            problem_messages.append(
+                f"validation result: {validation_value}"
+            )
+
+        return [], "ExifTool reported: " + "; ".join(problem_messages)
 
     date_candidates = []
 
-    # Parse every supported EXIF field that is present. Keeping the field name
-    # with the timestamp lets the conflict list explain exactly where each
-    # value came from.
-    for field_name, exif_date_text in exif_date_values.items():
-        # TIFF metadata may return a one-item sequence instead of a plain value.
-        if isinstance(exif_date_text, (list, tuple)):
-            exif_date_text = exif_date_text[0] if exif_date_text else None
-
-        if isinstance(exif_date_text, bytes):
-            try:
-                exif_date_text = exif_date_text.decode("ascii")
-            except UnicodeDecodeError as error:
-                return [], (
-                    f"EXIF {field_name} is not valid ASCII ({error})"
-                )
+    # Parse only the three fields that the previous Pillow implementation used.
+    # The ExifTool tag name and the familiar EXIF field name are both retained
+    # so the numbered conflict prompt remains clear to the user.
+    for exiftool_tag, field_name in EXIF_DATE_TAGS.items():
+        exif_date_text = get_first_metadata_value(metadata, exiftool_tag)
 
         if exif_date_text is None:
             continue
 
         try:
             exif_date = datetime.strptime(
-                exif_date_text,
+                str(exif_date_text),
                 EXIF_DATE_FORMAT,
             )
         except (TypeError, ValueError) as error:
@@ -184,10 +268,9 @@ def get_dates(filename):
     if date_candidates:
         return date_candidates, None
 
-    # A valid image without one of the supported EXIF date fields is not
-    # damaged. Preserve the original filesystem modification-time fallback.
-    modification_date = datetime.fromtimestamp(filename.stat().st_mtime)
-    return [(0, modification_date, DATETYPE[0])], None
+    # A readable file without one of the supported EXIF fields is not damaged.
+    # Preserve the previous filesystem modification-time fallback.
+    return modification_date_candidate(filename)
 
 
 def stems_are_related(base_stem, longer_stem):
@@ -384,6 +467,23 @@ except OSError as error:
 
 same_stem_groups = group_related_files(source_files)
 
+# Start one persistent ExifTool process for the complete run. PyExifTool keeps
+# this process open, so reading each file does not launch a new executable.
+# Group-family-1 names preserve the metadata location in returned JSON keys.
+try:
+    metadata_reader = ExifToolHelper(
+        common_args=["-G1", "-n"],
+    )
+    metadata_reader.run()
+except (FileNotFoundError, OSError, ValueError, ExifToolException) as error:
+    print(
+        "Error: PyExifTool could not start the ExifTool executable. "
+        "Install ExifTool and make sure it is available on PATH. "
+        f"Details: {error}"
+    )
+    input("Press Enter to exit")
+    raise SystemExit(1)
+
 copied_count = 0
 duplicate_count = 0
 renamed_count = 0
@@ -402,7 +502,10 @@ for same_stem_files in same_stem_groups:
     # candidates first allows conflicting values to be shown to the user.
     for same_stem_file in same_stem_files:
         try:
-            date_candidates, review_reason = get_dates(same_stem_file)
+            date_candidates, review_reason = get_dates(
+                metadata_reader,
+                same_stem_file,
+            )
         except OSError as error:
             print(
                 f"Error reading '{same_stem_file.name}': {error}",
@@ -589,6 +692,9 @@ for same_stem_files in same_stem_groups:
                 end="",
             )
         print()
+
+# Stop the persistent ExifTool subprocess before printing the final summary.
+metadata_reader.terminate()
 
 print()
 print(f"Classified directory: {classified_directory}")
