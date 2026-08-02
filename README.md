@@ -32,9 +32,13 @@ DateTimeEnd
 EndTime
 ProfileDateTime
 LayerModifyDates
+ExtensionCreateDate
+ExtensionModifyDate
 ```
 
-These cover camera/device operation, metadata history, resource modification, recording-end events, embedded color-profile creation, and Photoshop layer editing. Capture-oriented maker-note fields such as `SonyDateTime`, `SonyDateTime2`, `PanasonicDateTime`, and Olympus `DateTimeUTC` remain eligible.
+These cover camera/device operation, metadata history, resource modification, recording-end events, embedded color-profile creation, Photoshop layer editing, and FlashPix extension-object creation or modification. Capture-oriented local fields such as `SonyDateTime`, `SonyDateTime2`, `PanasonicDateTime`, `RicohDate`, and ordinary EXIF/XMP creation dates remain eligible.
+
+UTC counterparts such as `DateTimeUTC` and `GPSDateTime` are not offered as competing local creation dates. They are retained separately as timezone evidence.
 
 The embedded pass preserves ExifTool's raw date/time values instead of applying a global output format. This prevents partial IPTC fields from becoming artificial full timestamps: `IPTC:DateCreated` remains date-only, `IPTC:TimeCreated` remains time-only, and neither is offered independently. Composite fields such as `Composite:DateTimeCreated`, which genuinely combine the date and time components, remain eligible. Fractional seconds and timezone suffixes on complete timestamps are accepted.
 
@@ -46,22 +50,25 @@ When distinct complete embedded timestamps are found anywhere in a related group
 
 ## Timezone and daylight-saving validation
 
-At startup, the script asks for an IANA timezone used to interpret local capture times. Pressing Enter selects `Europe/Berlin`, which represents Central European Time and Central European Summer Time (`CET`/`CEST`) with the applicable historical EU transition rules. A different IANA name such as `Europe/London` or `America/New_York` may be entered for files photographed elsewhere.
+At startup, the script asks for an IANA timezone used to interpret local capture times. Pressing Enter selects `Europe/Berlin`, which represents Central European Time and Central European Summer Time (`CET`/`CEST`) with the applicable historical transition rules. A different IANA name such as `Europe/London` or `America/New_York` may be entered for files photographed elsewhere.
 
-In addition to `Time:All`, ExifTool is asked for camera timezone context including `DaylightSavings`, `TimeZone`, `TimeZoneCity`, `OffsetTimeOriginal`, `OffsetTimeDigitized`, and `TimeZoneOffset`. These fields are never treated as independent classification dates.
+Timezone handling is evidence-based rather than dispatched by camera brand. The same logic applies to Canon, Nikon, Sony, Fujifilm, Kodak, Olympus/OM System, Pentax, Ricoh, Panasonic/Lumix, Leica, GoPro, DJI, Phase One, Sigma, Hasselblad, phones, legacy cameras, and unknown or future devices whenever ExifTool exposes equivalent metadata.
 
-After one metadata timestamp has been selected for a related group, the script checks `DaylightSavings` only on base image files. Sidecars and suffix-derived images do not control the check. The selected date is evaluated against the timezone database rather than a fixed month/day approximation, so historical rule changes, the spring transition gap, and the repeated autumn hour can be distinguished.
+The script collects three general forms of evidence:
 
-When the camera's daylight-saving setting contradicts the selected timezone's unambiguous state, the script shows:
+1. Explicit offsets attached to timestamps or stored in fields such as `OffsetTimeOriginal`, `OffsetTimeDigitized`, `TimeZoneOffset`, `TimeZone`, or `TimeOffset`.
+2. UTC counterparts such as `DateTimeUTC` and `GPSDateTime`, from which the effective local UTC offset can be derived.
+3. Camera configuration such as `DaylightSavings`, or the active Pentax/Ricoh hometown/destination profile selected through `WorldTimeLocation`.
 
-- the camera setting and its metadata source;
-- the expected timezone abbreviation and UTC offset;
-- any explicit UTC offsets carried by the selected timestamp fields;
-- the original time and the timezone-derived corrected time.
+Only the profile relationship requires special handling; it is resolved from tag semantics and does not check the camera make or model.
 
-The user then chooses whether to keep the recorded wall-clock time or apply the daylight-saving adjustment for classification. The original image and its metadata are never rewritten. A corrected value is reported as `METADATA_DST_CORRECTED`.
+Camera configuration and UTC-reference evidence are accepted only from exact-base image or video files. A selected XMP sidecar may still contribute an explicit offset attached directly to its selected timestamp. Sidecars and suffix-derived media do not define the originating camera's configuration.
 
-An explicit timestamp offset is useful corroborating evidence. For example, an XMP timestamp carrying `+02:00` already agrees with `CEST`; if a maker-note `DaylightSavings` flag says Off, the flag may be stale while the recorded wall-clock time is already correct. The script therefore presents the evidence and leaves the correction decision to the user instead of changing the time automatically.
+The selected local time is evaluated with the IANA timezone database rather than a fixed month/day approximation. This handles historical rules, nonexistent times during the spring transition, and the repeated hour during the autumn transition.
+
+The default timezone alone is an assumption and never proves that the camera clock was wrong. The script prompts only when available offset, UTC, or DST metadata contradicts the selected timezone. It shows the expected state, the conflicting evidence, and any defensible corrected time. The user may keep the recorded wall-clock time or apply a correction for classification.
+
+The original files and their metadata are never rewritten. A corrected classification value is reported as `METADATA_TIMEZONE_CORRECTED`.
 
 ## Filesystem fallback
 
