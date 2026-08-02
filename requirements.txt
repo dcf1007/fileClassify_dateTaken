@@ -1,1 +1,2 @@
 PyExifTool>=0.5.4
+tzdata>=2024.1
