@@ -25,13 +25,33 @@ EXIFTOOL_TAGS = [
     "File:MIMEType",
 ]
 
-# -a retains duplicate tags instead of allowing ExifTool to suppress lower
-# priority copies. -ee extracts metadata from supported embedded documents and
-# streams. -d normalizes complete date/time values to the same format the
-# existing classifier already parses and displays.
+# Refine the Time:All request inside ExifTool instead of extracting everything
+# and discarding unwanted values afterward:
+#
+# - family-1 System excludes filesystem pseudo-tags from the embedded pass;
+# - PowerUpTime is a camera operational timestamp, not an image timestamp;
+# - XMP MetadataDate and HistoryWhen describe metadata/editing activity.
+#
+# -a retains duplicate tags and -ee reads supported embedded documents and
+# streams. -d normalizes complete timestamps to the format already used by the
+# classifier.
 EXIFTOOL_READ_PARAMS = [
     "-a",
     "-ee",
+    "-d",
+    "%Y:%m:%d %H:%M:%S",
+    "-x",
+    "1System:All",
+    "-x",
+    "PowerUpTime",
+    "-x",
+    "1XMP-xmp:MetadataDate",
+    "-x",
+    "1XMP-xmpMM:HistoryWhen",
+]
+
+FILE_MODIFY_DATE_TAGS = ["FileModifyDate"]
+FILE_MODIFY_DATE_PARAMS = [
     "-d",
     "%Y:%m:%d %H:%M:%S",
 ]
@@ -143,30 +163,22 @@ def is_image_file(filename, metadata):
     return filename.suffix.casefold() in IMAGE_EXTENSIONS
 
 
-def modification_date_candidate(filename):
-    """Return the original script's filesystem modification-time fallback."""
-    modification_date = datetime.fromtimestamp(filename.stat().st_mtime)
-    return [(0, modification_date, DATETYPE[0])], None
-
-
 def get_dates(metadata_reader, filename):
     """
-    Return (date_candidates, review_reason).
+    Return (date_candidates, review_reason, file_is_image).
 
-    All ExifTool Time:All tags are requested with duplicate and embedded
-    extraction enabled. Complete timestamps from EXIF, XMP, IPTC, QuickTime,
-    maker notes, composites, and other supported groups become candidates for
-    the existing numbered conflict prompt.
+    The first pass asks ExifTool for Time:All while excluding filesystem
+    pseudo-tags and the specifically non-creation timestamps listed in
+    EXIFTOOL_READ_PARAMS. Complete embedded timestamps from EXIF, XMP, IPTC,
+    QuickTime, maker notes, composites, and other supported metadata groups
+    become candidates for the existing numbered conflict prompt.
 
-    Filesystem timestamps returned inside Time:All are excluded from the
-    metadata candidate pass. The filesystem modification time remains the
-    original fallback only when no complete embedded timestamp exists.
-
-    The normal classification pass does not run ExifTool validation. Validation
-    checks metadata conformance and may warn about non-standard storage, such as
-    DateTimeOriginal being located in IFD0, even though the value is readable.
-    Timestamp extraction does not require those extra checks.
+    This function never falls back to a file timestamp. The caller first checks
+    the complete related group. Only when no embedded candidate exists anywhere
+    in that group may it request FileModifyDate from a base image file.
     """
+    extension_is_image = filename.suffix.casefold() in IMAGE_EXTENSIONS
+
     try:
         metadata_results = metadata_reader.get_tags(
             files=filename,
@@ -174,21 +186,27 @@ def get_dates(metadata_reader, filename):
             params=EXIFTOOL_READ_PARAMS,
         )
     except ExifToolExecuteError as error:
-        if filename.suffix.casefold() in IMAGE_EXTENSIONS:
+        if extension_is_image:
             error_message = error.stderr.strip() or str(error)
-            return [], f"ExifTool could not inspect the image ({error_message})"
+            return (
+                [],
+                f"ExifTool could not inspect the image ({error_message})",
+                True,
+            )
 
-        return modification_date_candidate(filename)
+        # Sidecars and other related files may legitimately contain no ExifTool
+        # metadata. They remain usable members of the group but provide no date.
+        return [], None, False
     except ExifToolException as error:
         raise OSError(
             f"ExifTool could not read metadata from '{filename}': {error}"
         ) from error
 
     if not metadata_results:
-        if filename.suffix.casefold() in IMAGE_EXTENSIONS:
-            return [], "ExifTool returned no metadata for the image"
+        if extension_is_image:
+            return [], "ExifTool returned no metadata for the image", True
 
-        return modification_date_candidate(filename)
+        return [], None, False
 
     metadata = metadata_results[0]
     file_is_image = is_image_file(filename, metadata)
@@ -202,11 +220,10 @@ def get_dates(metadata_reader, filename):
         if tag_name in {"FileType", "MIMEType"}:
             continue
 
-        # With -G0:1:4, filesystem pseudo-tags are named File:System:... .
-        # The previous check looked only for System in the first group position,
-        # so FileModifyDate, FileCreateDate, and FileAccessDate leaked into the
-        # numbered choices. Match both group families explicitly instead.
-        if len(groups) >= 2 and groups[0:2] == ["File", "System"]:
+        # The ExifTool request already excludes the family-1 System group.
+        # Retain this narrow guard only as a safety invariant in case a future
+        # ExifTool version returns an explicitly requested System pseudo-tag.
+        if "System" in groups:
             continue
 
         date_text = str(metadata_value).strip()
@@ -217,9 +234,9 @@ def get_dates(metadata_reader, filename):
                 EXIF_DATE_FORMAT,
             )
         except ValueError:
-            # Time:All also includes date-only, time-only, duration, and other
-            # timing fields. They are read, but cannot independently determine
-            # a YYYY-MM-DD destination and are therefore not candidates.
+            # Time:All also contains date-only, time-only, duration, and other
+            # timing values. They are read but cannot independently choose a
+            # YYYY-MM-DD destination.
             looks_like_complete_date = (
                 len(date_text) >= 19
                 and date_text[0:4].isdigit()
@@ -237,17 +254,62 @@ def get_dates(metadata_reader, filename):
             (1, metadata_date, metadata_key)
         )
 
-    # A complete-looking but unparseable metadata date remains a review case,
-    # preserving the existing protection against silently using invalid dates.
     if invalid_date_messages and file_is_image:
-        return [], "invalid metadata date: " + "; ".join(
-            invalid_date_messages
+        return (
+            [],
+            "invalid metadata date: " + "; ".join(invalid_date_messages),
+            True,
         )
 
-    if date_candidates:
-        return date_candidates, None
+    return date_candidates, None, file_is_image
 
-    return modification_date_candidate(filename)
+
+def get_file_modify_date(metadata_reader, filename):
+    """
+    Return the ExifTool FileModifyDate candidate for one base image file.
+
+    FileModifyDate is requested separately so FileCreateDate, FileAccessDate,
+    and other System pseudo-tags are never read for fallback selection.
+    """
+    try:
+        metadata_results = metadata_reader.get_tags(
+            files=filename,
+            tags=FILE_MODIFY_DATE_TAGS,
+            params=FILE_MODIFY_DATE_PARAMS,
+        )
+    except ExifToolException as error:
+        raise OSError(
+            f"ExifTool could not read FileModifyDate from '{filename}': "
+            f"{error}"
+        ) from error
+
+    if not metadata_results:
+        return None, "ExifTool returned no FileModifyDate"
+
+    metadata = metadata_results[0]
+    modification_date_text = get_first_metadata_value(
+        metadata,
+        "FileModifyDate",
+    )
+
+    if modification_date_text is None:
+        return None, "ExifTool returned no FileModifyDate"
+
+    try:
+        modification_date = datetime.strptime(
+            str(modification_date_text),
+            EXIF_DATE_FORMAT,
+        )
+    except ValueError as error:
+        return None, (
+            f"invalid FileModifyDate {modification_date_text!r} ({error})"
+        )
+
+    return (
+        0,
+        modification_date,
+        "File:System:FileModifyDate",
+    ), None
 
 
 def stems_are_related(base_stem, longer_stem):
@@ -301,8 +363,11 @@ def group_related_files(files):
             groups[stem] = list(files_by_stem[stem])
 
     return [
-        sorted(group, key=lambda path: path.name.casefold())
-        for _, group in sorted(
+        (
+            base_stem,
+            sorted(group, key=lambda path: path.name.casefold()),
+        )
+        for base_stem, group in sorted(
             groups.items(),
             key=lambda item: item[0].casefold(),
         )
@@ -468,17 +533,19 @@ failed_count = 0
 
 # Follow the original processing flow: determine one preferred date for each
 # related group, then copy the files to that group's date directory.
-for same_stem_files in same_stem_groups:
+for base_stem, same_stem_files in same_stem_groups:
     file_dates = {}
+    usable_files = set()
+    base_image_files = []
     review_reasons = {}
     selected_file_date = None
 
-    # Read every usable date before selecting the date for the group. Collecting
-    # all candidates allows conflicts between files, metadata families, storage
-    # locations, and duplicate tag instances to be shown to the user.
+    # First pass: collect only embedded metadata timestamps from every related
+    # file. Sidecars may contribute embedded XMP/IPTC metadata, but no file in
+    # this pass contributes filesystem timestamps.
     for same_stem_file in same_stem_files:
         try:
-            date_candidates, review_reason = get_dates(
+            date_candidates, review_reason, file_is_image = get_dates(
                 metadata_reader,
                 same_stem_file,
             )
@@ -499,7 +566,60 @@ for same_stem_files in same_stem_groups:
             review_reasons[same_stem_file] = review_reason
             continue
 
-        file_dates[same_stem_file] = date_candidates
+        usable_files.add(same_stem_file)
+
+        if date_candidates:
+            file_dates[same_stem_file] = date_candidates
+
+        # A fallback source must be an image whose stem is exactly the base stem
+        # chosen by group_related_files(). This excludes sidecars and suffix-
+        # derived images such as IMG_0001-edit.jpg.
+        if (
+            file_is_image
+            and same_stem_file.stem.casefold() == base_stem.casefold()
+        ):
+            base_image_files.append(same_stem_file)
+
+    # Second pass: only when the complete related group has no embedded
+    # timestamp, request FileModifyDate from the base image file(s). The request
+    # names only FileModifyDate, so create/access dates are never extracted.
+    if not file_dates:
+        for base_image_file in base_image_files:
+            try:
+                file_modify_candidate, review_reason = get_file_modify_date(
+                    metadata_reader,
+                    base_image_file,
+                )
+            except OSError as error:
+                print(
+                    f"Error reading '{base_image_file.name}': {error}",
+                    file=sys.stderr,
+                )
+                failed_count += 1
+                usable_files.discard(base_image_file)
+                continue
+
+            if review_reason is not None:
+                print(
+                    f"Warning: '{base_image_file.name}' requires review: "
+                    f"{review_reason}",
+                    file=sys.stderr,
+                )
+                review_reasons[base_image_file] = review_reason
+                usable_files.discard(base_image_file)
+                continue
+
+            file_dates.setdefault(base_image_file, []).append(
+                file_modify_candidate
+            )
+
+    # If neither embedded metadata nor a base-image FileModifyDate is available,
+    # the group has no defensible classification date.
+    if not file_dates:
+        for same_stem_file in usable_files:
+            review_reasons[same_stem_file] = (
+                "no embedded timestamp and no base image FileModifyDate"
+            )
 
     # Group identical timestamp values together, whether they came from
     # separate files, separate metadata fields, or duplicate tag instances.
@@ -590,7 +710,7 @@ for same_stem_files in same_stem_groups:
             folder_name = UNCLASSIFIED_FOLDER_NAME
             destination_directory = unclassified_directory
         elif (
-            same_stem_file in file_dates
+            same_stem_file in usable_files
             and selected_file_date is not None
         ):
             date_folder_name = selected_file_date[1].strftime("%Y-%m-%d")
