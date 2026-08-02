@@ -1289,6 +1289,23 @@ def collect_timezone_evidence(
     return dst_records, offset_records, display_records
 
 
+def build_automatic_correction_key(
+    correction_delta,
+    recorded_dst_states,
+    expected_dst_states,
+    observed_offsets,
+    expected_offsets,
+):
+    """Return a conservative key for reusing one approved correction."""
+    return (
+        int(correction_delta.total_seconds()),
+        tuple(sorted(recorded_dst_states)),
+        tuple(sorted(expected_dst_states)),
+        tuple(sorted(observed_offsets)),
+        tuple(sorted(expected_offsets)),
+    )
+
+
 def review_timezone_evidence(
     selected_file_date,
     selected_date_option,
@@ -1297,8 +1314,11 @@ def review_timezone_evidence(
     utc_records_by_file,
     timezone_name,
     classification_timezone,
+    automatic_correction_rules=None,
 ):
     """Offer corrections only when metadata evidence contradicts the zone."""
+    if automatic_correction_rules is None:
+        automatic_correction_rules = set()
     if selected_file_date is None:
         return selected_file_date
 
@@ -1466,6 +1486,36 @@ def review_timezone_evidence(
         )
 
     correction_options = sorted(correction_reasons.items())
+
+    automatic_matches = []
+    for corrected_datetime, reasons in correction_options:
+        correction_delta = corrected_datetime - selected_datetime
+        correction_key = build_automatic_correction_key(
+            correction_delta,
+            recorded_dst_states,
+            expected_dst_states,
+            observed_offsets,
+            expected_offsets,
+        )
+        if correction_key in automatic_correction_rules:
+            automatic_matches.append(
+                (corrected_datetime, reasons, correction_delta)
+            )
+
+    # Reuse a prior decision only when one exact evidence/correction signature
+    # matches. Ambiguous or materially different cases continue to prompt.
+    if len(automatic_matches) == 1:
+        corrected_datetime, _, correction_delta = automatic_matches[0]
+        signed_hours = correction_delta.total_seconds() / 3600
+        hour_unit = "hour" if abs(signed_hours) == 1 else "hours"
+        print(
+            "  Automatically applying the previously approved matching "
+            f"correction ({signed_hours:+g} {hour_unit}): "
+            f"{corrected_datetime.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        print()
+        return (2, corrected_datetime)
+
     print("Choose how this group should be classified:")
     print(
         "  1. Keep "
@@ -1497,10 +1547,36 @@ def review_timezone_evidence(
         correction_index = selected_number - 2
         if 0 <= correction_index < len(correction_options):
             corrected_datetime = correction_options[correction_index][0]
+            correction_delta = corrected_datetime - selected_datetime
+            correction_key = build_automatic_correction_key(
+                correction_delta,
+                recorded_dst_states,
+                expected_dst_states,
+                observed_offsets,
+                expected_offsets,
+            )
             print(
                 "Selected timezone correction: "
                 f"{corrected_datetime.strftime('%Y-%m-%d %H:%M:%S')}"
             )
+
+            while True:
+                reuse_selection = input(
+                    "Automatically apply this same correction to all later "
+                    "groups with the same daylight-saving/offset mismatch "
+                    "during this run? [y/N]: "
+                ).strip().casefold()
+                if reuse_selection in {"", "n", "no"}:
+                    break
+                if reuse_selection in {"y", "yes"}:
+                    automatic_correction_rules.add(correction_key)
+                    print(
+                        "This exact correction and evidence pattern will be "
+                        "applied automatically to later matching groups."
+                    )
+                    break
+                print("Invalid selection. Enter y or n.")
+
             print()
             return (2, corrected_datetime)
         print("Invalid selection. Enter one of the listed numbers.")
@@ -1934,6 +2010,8 @@ review_count = 0
 failed_count = 0
 metadata_updated_count = 0
 metadata_skipped_count = 0
+# Session-only approvals for exact recurring timezone/DST mismatch patterns.
+automatic_correction_rules = set()
 
 try:
     for base_stem, same_stem_files in same_stem_groups:
@@ -2128,6 +2206,7 @@ try:
                 utc_records_by_file,
                 timezone_name,
                 classification_timezone,
+                automatic_correction_rules,
             )
             if selected_file_date[0] == 2:
                 timezone_correction_delta = (
