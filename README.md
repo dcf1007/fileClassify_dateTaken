@@ -8,7 +8,7 @@ The script does not scan subdirectories. Classified copies are written to `class
 
 - Python 3.8 or newer
 - Phil Harvey's ExifTool 12.15 or newer, available as `exiftool` or `exiftool.exe` on the system `PATH`
-- PyExifTool 0.5.6
+- PyExifTool 0.5.4 or newer
 
 Install the Python dependency with:
 
