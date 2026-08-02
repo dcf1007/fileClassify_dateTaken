@@ -1,3 +1,4 @@
+import re
 import shutil
 import sys
 from datetime import datetime
@@ -50,17 +51,19 @@ EXCLUDED_TIME_TAGS = (
     # Recording or resource end timestamps.
     "DateTimeEnd",
     "EndTime",
+    # Dates belonging to embedded resources or edit structures.
+    "ProfileDateTime",
+    "LayerModifyDates",
 )
 
 # -a retains duplicate tags and -ee reads supported embedded documents and
-# streams. -d normalizes complete timestamps to the format already used by the
-# classifier. Family-1 System is excluded so filesystem pseudo-tags never enter
+# streams. The embedded pass deliberately has no global -d format: raw values
+# are needed to distinguish complete timestamps from date-only and time-only
+# IPTC fields. Family-1 System is excluded so filesystem pseudo-tags never enter
 # the embedded-metadata pass.
 EXIFTOOL_READ_PARAMS = [
     "-a",
     "-ee",
-    "-d",
-    "%Y:%m:%d %H:%M:%S",
     "-x",
     "1System:All",
 ]
@@ -74,6 +77,11 @@ FILE_MODIFY_DATE_PARAMS = [
 ]
 
 EXIF_DATE_FORMAT = "%Y:%m:%d %H:%M:%S"
+COMPLETE_DATE_TIME_PATTERN = re.compile(
+    r"^\d{4}[:-]\d{2}[:-]\d{2}[ T]"
+    r"\d{2}:\d{2}:\d{2}(?:\.\d+)?"
+    r"(?:Z|[+-]\d{2}:?\d{2})?$"
+)
 CLASSIFIED_FOLDER_NAME = "classified"
 UNCLASSIFIED_FOLDER_NAME = "unclassified"
 COPY_CHUNK_SIZE = 1024 * 1024
@@ -180,6 +188,58 @@ def is_image_file(filename, metadata):
     return filename.suffix.casefold() in IMAGE_EXTENSIONS
 
 
+def parse_complete_metadata_datetime(metadata_value):
+    """
+    Parse one complete ExifTool date/time value without inventing components.
+
+    The embedded metadata pass keeps ExifTool's raw values. Date-only values
+    such as IPTC DateCreated and time-only values such as IPTC TimeCreated do
+    not match COMPLETE_DATE_TIME_PATTERN and return None. Composite fields that
+    combine both components remain eligible.
+
+    Timezone offsets and fractional seconds are accepted. The classifier keeps
+    its existing wall-clock comparison and folder behavior by removing timezone
+    information after parsing.
+    """
+    date_text = str(metadata_value).strip()
+    if not COMPLETE_DATE_TIME_PATTERN.fullmatch(date_text):
+        return None
+
+    normalized_date_text = date_text
+
+    # datetime.fromisoformat expects hyphens in the calendar portion. ExifTool
+    # commonly uses EXIF's YYYY:MM:DD form, so normalize only those separators.
+    if normalized_date_text[4] == ":" and normalized_date_text[7] == ":":
+        normalized_date_text = (
+            normalized_date_text[:4]
+            + "-"
+            + normalized_date_text[5:7]
+            + "-"
+            + normalized_date_text[8:]
+        )
+
+    if normalized_date_text[10] == " ":
+        normalized_date_text = (
+            normalized_date_text[:10]
+            + "T"
+            + normalized_date_text[11:]
+        )
+
+    if normalized_date_text.endswith("Z"):
+        normalized_date_text = normalized_date_text[:-1] + "+00:00"
+
+    # Accept offsets written as +HHMM in addition to +HH:MM.
+    if re.search(r"[+-]\d{4}$", normalized_date_text):
+        normalized_date_text = (
+            normalized_date_text[:-2]
+            + ":"
+            + normalized_date_text[-2:]
+        )
+
+    parsed_date = datetime.fromisoformat(normalized_date_text)
+    return parsed_date.replace(tzinfo=None)
+
+
 def get_dates(metadata_reader, filename):
     """
     Return (date_candidates, review_reason, file_is_image).
@@ -243,28 +303,18 @@ def get_dates(metadata_reader, filename):
         if "System" in groups or tag_name in EXCLUDED_TIME_TAGS:
             continue
 
-        date_text = str(metadata_value).strip()
-
         try:
-            metadata_date = datetime.strptime(
-                date_text,
-                EXIF_DATE_FORMAT,
-            )
+            metadata_date = parse_complete_metadata_datetime(metadata_value)
         except ValueError:
-            # Time:All also contains date-only, time-only, duration, and other
-            # timing values. They are read but cannot independently choose a
-            # YYYY-MM-DD destination.
-            looks_like_complete_date = (
-                len(date_text) >= 19
-                and date_text[0:4].isdigit()
-                and date_text[4] in {":", "-"}
-                and date_text[7] in {":", "-"}
-                and date_text[10] in {" ", "T"}
+            # A value with the complete date/time shape but invalid calendar
+            # data remains a review case. Partial date/time values return None
+            # and are simply not standalone candidates.
+            invalid_date_messages.append(
+                f"{metadata_key}={metadata_value!r}"
             )
-            if looks_like_complete_date:
-                invalid_date_messages.append(
-                    f"{metadata_key}={metadata_value!r}"
-                )
+            continue
+
+        if metadata_date is None:
             continue
 
         date_candidates.append(
@@ -327,6 +377,26 @@ def get_file_modify_date(metadata_reader, filename):
         modification_date,
         "File:System:FileModifyDate",
     ), None
+
+
+def format_date_sources(sources):
+    """
+    Format one timestamp's sources with each filename displayed only once.
+
+    Repeated list values and duplicate tag instances are also collapsed so the
+    prompt shows a concise list of unique fields for each file.
+    """
+    fields_by_file = {}
+
+    for filename, source_name in sources:
+        source_fields = fields_by_file.setdefault(filename, [])
+        if source_name not in source_fields:
+            source_fields.append(source_name)
+
+    return ", ".join(
+        f"{filename.name} ({', '.join(source_fields)})"
+        for filename, source_fields in fields_by_file.items()
+    )
 
 
 def stems_are_related(base_stem, longer_stem):
@@ -678,9 +748,8 @@ for base_stem, same_stem_files in same_stem_groups:
             sorted_date_options,
             start=1,
         ):
-            date_sources = ", ".join(
-                f"{filename.name} ({source_name})"
-                for filename, source_name in date_option["sources"]
+            date_sources = format_date_sources(
+                date_option["sources"]
             )
             print(
                 f"  {option_number}. "
