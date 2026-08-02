@@ -30,13 +30,17 @@ TrackModifyDate
 LastModifyDate
 DateTimeEnd
 EndTime
+ProfileDateTime
+LayerModifyDates
 ```
 
-These cover camera/device operation, metadata history, resource modification, and recording-end events. Capture-oriented maker-note fields such as `SonyDateTime`, `SonyDateTime2`, `PanasonicDateTime`, and Olympus `DateTimeUTC` remain eligible.
+These cover camera/device operation, metadata history, resource modification, recording-end events, embedded color-profile creation, and Photoshop layer editing. Capture-oriented maker-note fields such as `SonyDateTime`, `SonyDateTime2`, `PanasonicDateTime`, and Olympus `DateTimeUTC` remain eligible.
+
+The embedded pass preserves ExifTool's raw date/time values instead of applying a global output format. This prevents partial IPTC fields from becoming artificial full timestamps: `IPTC:DateCreated` remains date-only, `IPTC:TimeCreated` remains time-only, and neither is offered independently. Composite fields such as `Composite:DateTimeCreated`, which genuinely combine the date and time components, remain eligible. Fractional seconds and timezone suffixes on complete timestamps are accepted.
 
 The remaining timestamps may come from EXIF, XMP, IPTC, QuickTime, maker notes, composite tags, and other metadata families supported by ExifTool. `-G0:1:4` preserves the metadata type, exact storage location, and duplicate instance number.
 
-When distinct complete embedded timestamps are found anywhere in a related group, the script lists their full ExifTool source paths and asks the user to choose one.
+When distinct complete embedded timestamps are found anywhere in a related group, the script lists their full ExifTool source paths and asks the user to choose one. Each filename is displayed once per option, followed by all matching fields for that file. Duplicate occurrences of the same field are collapsed.
 
 ## Filesystem fallback
 
