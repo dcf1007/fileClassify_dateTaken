@@ -26,15 +26,36 @@ EXIFTOOL_TAGS = [
 ]
 
 # Refine the Time:All request inside ExifTool instead of extracting everything
-# and discarding unwanted values afterward:
+# and discarding unwanted values afterward. The excluded tags describe camera
+# operation, metadata/editing activity, resource modification, or recording end
+# rather than when the image or recording was originally created.
 #
-# - family-1 System excludes filesystem pseudo-tags from the embedded pass;
-# - PowerUpTime is a camera operational timestamp, not an image timestamp;
-# - XMP MetadataDate and HistoryWhen describe metadata/editing activity.
-#
+# Capture-oriented maker-note fields such as SonyDateTime, SonyDateTime2,
+# PanasonicDateTime, and Olympus DateTimeUTC are intentionally retained.
+EXCLUDED_TIME_TAGS = (
+    # Camera/device operation rather than capture.
+    "PowerUpTime",
+    "TimeSincePowerOn",
+    "RunTimeSincePowerUp",
+    "ShotNumberSincePowerUp",
+    # Metadata and application history.
+    "MetadataDate",
+    "HistoryWhen",
+    # Modification timestamps rather than original creation.
+    "ModifyDate",
+    "SubSecModifyDate",
+    "MediaModifyDate",
+    "TrackModifyDate",
+    "LastModifyDate",
+    # Recording or resource end timestamps.
+    "DateTimeEnd",
+    "EndTime",
+)
+
 # -a retains duplicate tags and -ee reads supported embedded documents and
 # streams. -d normalizes complete timestamps to the format already used by the
-# classifier.
+# classifier. Family-1 System is excluded so filesystem pseudo-tags never enter
+# the embedded-metadata pass.
 EXIFTOOL_READ_PARAMS = [
     "-a",
     "-ee",
@@ -42,13 +63,9 @@ EXIFTOOL_READ_PARAMS = [
     "%Y:%m:%d %H:%M:%S",
     "-x",
     "1System:All",
-    "-x",
-    "PowerUpTime",
-    "-x",
-    "1XMP-xmp:MetadataDate",
-    "-x",
-    "1XMP-xmpMM:HistoryWhen",
 ]
+for excluded_time_tag in EXCLUDED_TIME_TAGS:
+    EXIFTOOL_READ_PARAMS.extend(["-x", excluded_time_tag])
 
 FILE_MODIFY_DATE_TAGS = ["FileModifyDate"]
 FILE_MODIFY_DATE_PARAMS = [
@@ -220,10 +237,10 @@ def get_dates(metadata_reader, filename):
         if tag_name in {"FileType", "MIMEType"}:
             continue
 
-        # The ExifTool request already excludes the family-1 System group.
-        # Retain this narrow guard only as a safety invariant in case a future
-        # ExifTool version returns an explicitly requested System pseudo-tag.
-        if "System" in groups:
+        # The ExifTool request already excludes the family-1 System group and
+        # the semantic exclusions above. Retain both checks as safety invariants
+        # in case a future ExifTool version returns an explicitly excluded tag.
+        if "System" in groups or tag_name in EXCLUDED_TIME_TAGS:
             continue
 
         date_text = str(metadata_value).strip()
