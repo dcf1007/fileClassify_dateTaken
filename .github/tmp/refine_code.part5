@@ -1,0 +1,56 @@
+
+# Collapse the short adjacent f-strings produced by the previous cleanup helper
+# into single expressions so Black cannot place them back on one line as
+# ``f"..." f"..."``.
+_apply_small_cleanups_v2 = apply_small_cleanups
+
+
+def apply_small_cleanups(source: str) -> str:
+    """Apply the verified cleanup and collapse generated adjacent f-strings."""
+    source = _apply_small_cleanups_v2(source)
+    replacements = {
+        (
+            'f"  Selected local time: "\n'
+            '            f"{selected_datetime.strftime(\'%Y-%m-%d %H:%M:%S\')}"'
+        ): (
+            'f"  Selected local time: '
+            '{selected_datetime.strftime(\'%Y-%m-%d %H:%M:%S\')}"'
+        ),
+        (
+            'f"  1. Keep "\n'
+            '        f"{selected_datetime.strftime(\'%Y-%m-%d %H:%M:%S\')}"'
+        ): (
+            'f"  1. Keep '
+            '{selected_datetime.strftime(\'%Y-%m-%d %H:%M:%S\')}"'
+        ),
+        (
+            'f"Selected date: "\n'
+            '            f"{selected_date_value.strftime(\'%Y-%m-%d %H:%M:%S\')}"'
+        ): (
+            'f"Selected date: '
+            '{selected_date_value.strftime(\'%Y-%m-%d %H:%M:%S\')}"'
+        ),
+        (
+            'f"Error copying or updating \'{same_stem_file.name}\': "\n'
+            '                f"{error}"'
+        ): (
+            'f"Error copying or updating '
+            '\'{same_stem_file.name}\': {error}"'
+        ),
+        (
+            '"Copies with corrected metadata/system time: "\n'
+            '        f"{stats[\'metadata_updated\']}"'
+        ): (
+            'f"Copies with corrected metadata/system time: '
+            '{stats[\'metadata_updated\']}"'
+        ),
+    }
+    for old, new in replacements.items():
+        count = source.count(old)
+        if count != 1:
+            raise SystemExit(
+                f"Expected one adjacent-string cleanup match, found {count}: "
+                f"{old[:80]!r}"
+            )
+        source = source.replace(old, new, 1)
+    return source
