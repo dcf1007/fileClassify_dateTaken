@@ -1,0 +1,239 @@
+        r'''
+
+        ## Code organization
+
+        `reclassify_datetaken.py` remains a single-file utility, but it is divided
+        into explicit responsibility sections:
+
+        - configuration and metadata policy;
+        - ExifTool metadata reading and value parsing;
+        - timezone and daylight-saving validation;
+        - metadata and filesystem correction writing;
+        - date classification and mismatch handling;
+        - related-file grouping and collision-safe copying;
+        - the high-level classification workflow and command-line entry point.
+
+        The low-level metadata and timezone rules are kept separate from prompts
+        and file-copy orchestration. The bottom of the file contains `main()` and
+        the small workflow functions, so the complete execution path can be read
+        from top to bottom without following module-level procedural code.
+        '''
+    ).rstrip() + "\n"
+
+    first_section = readme.find("\n## ")
+    if first_section == -1:
+        readme = readme.rstrip() + section_text
+    else:
+        readme = (
+            readme[:first_section].rstrip()
+            + section_text
+            + readme[first_section:]
+        )
+    README_PATH.write_text(readme, encoding="utf-8")
+
+
+def main() -> None:
+    source = SOURCE_PATH.read_text(encoding="utf-8")
+    preamble, functions = extract_functions(source)
+    imports, constants = split_imports_and_constants(preamble)
+
+    sections = [
+        (
+            "USER INPUT AND BASIC CONFIGURATION",
+            "Small helpers that normalize interactive input. The detailed timezone "
+            "rules live in their own section below.",
+            ["clean_input_path"],
+        ),
+        (
+            "EXIFTOOL METADATA READING AND VALUE PARSING",
+            "These functions are the boundary between ExifTool data and the rest of "
+            "the program. They preserve raw metadata semantics and never invent "
+            "missing date or time components.",
+            [
+                "split_metadata_key",
+                "iter_metadata_values",
+                "get_metadata_values",
+                "get_first_metadata_value",
+                "is_image_file",
+                "is_capture_media_file",
+                "parse_timezone_offset_minutes",
+                "parse_context_offset",
+                "parse_complete_metadata_datetime",
+                "parse_partial_datetime",
+                "parse_daylight_savings_value",
+                "parse_world_time_location",
+                "get_metadata_write_target",
+                "format_complete_datetime",
+                "format_date_only",
+                "format_time_only",
+                "normalize_target",
+                "read_correction_metadata",
+                "get_dates",
+                "get_file_modify_date",
+            ],
+        ),
+        (
+            "TIMEZONE AND DAYLIGHT-SAVING VALIDATION",
+            "This section converts offsets, UTC counterparts, and camera settings "
+            "into generic evidence. It determines when a correction is defensible "
+            "and keeps the user-facing DST decision in one place.",
+            [
+                "request_classification_timezone",
+                "timezone_states_for_local_time",
+                "daylight_saving_delta_for_year",
+                "derive_offset_from_utc",
+                "format_utc_offset",
+                "format_exif_offset",
+                "get_unambiguous_timezone_state",
+                "get_unambiguous_timezone_offset",
+                "resolve_system_timestamp_offset",
+                "system_datetime_to_epoch_ns",
+                "format_records_by_file",
+                "resolve_camera_configuration",
+                "collect_timezone_evidence",
+                "build_automatic_correction_key",
+                "review_timezone_evidence",
+            ],
+        ),
+        (
+            "METADATA AND FILESYSTEM CORRECTION WRITING",
+            "Correction planning is separate from classification decisions. These "
+            "functions build absolute writes, execute them through ExifTool, verify "
+            "the result, and align supported system timestamps on classified copies.",
+            [
+                "add_correction_operation",
+                "format_context_offset_value",
+                "raw_dst_write_value",
+                "operation_matches",
+                "build_correction_operations",
+                "execute_correction_operations",
+                "update_corrected_copy_metadata",
+            ],
+        ),
+        (
+            "DATE CLASSIFICATION AND MISMATCH HANDLING",
+            "Date options are assembled and displayed here. The workflow records "
+            "rejected embedded values so only relevant capture/creation fields are "
+            "normalized after the user chooses the authoritative date.",
+            ["format_date_sources"],
+        ),
+        (
+            "RELATED-FILE GROUPING AND COLLISION-SAFE COPYING",
+            "These functions determine related stems, preserve originals, avoid "
+            "overwrites, detect binary duplicates, and update only classified copies.",
+            [
+                "stems_are_related",
+                "group_related_files",
+                "files_are_binary_identical",
+                "copy_file_safely",
+                "find_previous_corrected_duplicate",
+                "copy_file_with_corrected_metadata",
+            ],
+        ),
+    ]
+
+    accounted = {
+        function_name
+        for _, _, names in sections
+        for function_name in names
+    }
+    unaccounted = ORIGINAL_FUNCTIONS - accounted
+    duplicated = [
+        name
+        for name in ORIGINAL_FUNCTIONS
+        if sum(name in names for _, _, names in sections) != 1
+    ]
+    if unaccounted or duplicated:
+        raise SystemExit(
+            f"Section inventory error: unaccounted={sorted(unaccounted)}, "
+            f"duplicated={sorted(duplicated)}"
+        )
+
+    output = [
+        textwrap.dedent(
+            r'''
+            """
+            Classify related media files by their best supported capture date.
+
+            The script keeps original files unchanged, uses ExifTool for broad
+            metadata support, and organizes classified copies by ``YYYY-MM-DD``.
+            The module is ordered by responsibility: metadata I/O, timezone/DST
+            validation, correction writing, date decisions, copying, then the
+            high-level interactive workflow.
+            """
+            '''
+        ).strip(),
+        "",
+        imports,
+        "",
+        section(
+            "CONFIGURATION AND METADATA POLICY",
+            "Constants in this section define what ExifTool reads, which timestamps "
+            "are capture candidates, which fields are contextual evidence, and how "
+            "classified copies may be corrected.",
+        ).rstrip(),
+        constants,
+        "",
+    ]
+
+    workflow_ast = ast.parse(NEW_WORKFLOW_FUNCTIONS)
+    workflow_lines = NEW_WORKFLOW_FUNCTIONS.splitlines(keepends=True)
+    workflow_functions = {
+        node.name: "".join(
+            workflow_lines[node.lineno - 1 : node.end_lineno]
+        ).rstrip()
+        for node in workflow_ast.body
+        if isinstance(node, ast.FunctionDef)
+    }
+
+    for title, description, names in sections:
+        output.append(section(title, description).rstrip())
+        output.extend(functions[name] for name in names)
+        output.append("")
+
+        if title == "DATE CLASSIFICATION AND MISMATCH HANDLING":
+            output.extend(
+                workflow_functions[name]
+                for name in ("build_date_options", "choose_group_date")
+            )
+            output.append("")
+
+    workflow_names = [
+        "prepare_run",
+        "start_metadata_reader",
+        "create_run_stats",
+        "scan_related_group",
+        "review_group_timezone",
+        "copy_group_files",
+        "process_related_group",
+        "print_run_summary",
+        "run_classification",
+        "main",
+    ]
+
+    output.append(
+        section(
+            "CLASSIFICATION WORKFLOW AND COMMAND-LINE ENTRY POINT",
+            "The functions below make the execution path explicit: prepare the run, "
+            "scan one related group, resolve its decisions, copy it, report results, "
+            "and terminate ExifTool in a finally block.",
+        ).rstrip()
+    )
+    output.extend(workflow_functions[name] for name in workflow_names)
+    output.extend(
+        [
+            "",
+            'if __name__ == "__main__":',
+            "    raise SystemExit(main())",
+            "",
+        ]
+    )
+
+    generated = "\n\n".join(part.rstrip() for part in output if part != "") + "\n"
+    ast.parse(generated)
+    SOURCE_PATH.write_text(generated, encoding="utf-8")
+    update_readme()
+
+
+if __name__ == "__main__":
+    main()
