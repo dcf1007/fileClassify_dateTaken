@@ -524,6 +524,40 @@ def get_unambiguous_timezone_offset(local_datetime, classification_timezone):
     return state[1] if state is not None else None
 
 
+def resolve_system_timestamp_offset(
+    local_datetime,
+    classification_timezone,
+    preferred_offset_minutes=None,
+):
+    """Resolve one UTC offset for an absolute filesystem timestamp."""
+    valid_offsets = {
+        state[1]
+        for state in timezone_states_for_local_time(
+            local_datetime,
+            classification_timezone,
+        )
+    }
+    if preferred_offset_minutes in valid_offsets:
+        return preferred_offset_minutes
+    if len(valid_offsets) == 1:
+        return next(iter(valid_offsets))
+    return None
+
+
+def system_datetime_to_epoch_ns(local_datetime, offset_minutes):
+    """Convert a chosen local timestamp and offset to Unix nanoseconds."""
+    aware_datetime = local_datetime.replace(
+        tzinfo=timezone(timedelta(minutes=offset_minutes))
+    )
+    utc_datetime = aware_datetime.astimezone(timezone.utc)
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    delta = utc_datetime - epoch
+    return (
+        (delta.days * 86400 + delta.seconds) * 1_000_000_000
+        + delta.microseconds * 1000
+    )
+
+
 def get_metadata_write_target(groups, tag_name, raw=False):
     """Map a -G0:1:4 extraction path to an explicit writable group target."""
     if not groups or "System" in groups or groups[0] in {"Composite", "File"}:
@@ -734,11 +768,16 @@ def build_correction_operations(
     selected_corrected_datetime,
     classification_timezone,
     conflicting_date_values=None,
+    align_system_times=False,
+    preferred_system_offset_minutes=None,
 ):
-    """Build writes for timezone correction and chosen-date alignment."""
+    """Build metadata and system-create-date alignment operations."""
     timezone_correction_active = correction_delta is not None
     effective_correction_delta = correction_delta or timedelta(0)
     conflicting_date_values = set(conflicting_date_values or ())
+    metadata_correction_active = (
+        timezone_correction_active or bool(conflicting_date_values)
+    )
     operations = {}
     skipped = set()
     records = list(iter_metadata_values(source_metadata))
@@ -973,6 +1012,8 @@ def build_correction_operations(
         for date_tag, offset_tag in ASSOCIATED_OFFSET_TAGS.items()
     }
     for tag_name in OFFSET_CONTEXT_TAGS:
+        if not metadata_correction_active:
+            break
         for metadata_key, groups, raw_value in values_by_tag.get(tag_name, []):
             family_zero = groups[0] if groups else ""
             reference_values = corrected_local_values.get(
@@ -1016,9 +1057,13 @@ def build_correction_operations(
                 },
             )
 
-    expected_state = get_unambiguous_timezone_state(
-        selected_corrected_datetime,
-        classification_timezone,
+    expected_state = (
+        get_unambiguous_timezone_state(
+            selected_corrected_datetime,
+            classification_timezone,
+        )
+        if metadata_correction_active
+        else None
     )
     if expected_state is not None:
         expected_dst = expected_state[0]
@@ -1060,42 +1105,55 @@ def build_correction_operations(
                     },
                 )
 
-    # System creation time is shifted only for a timezone/DST correction.
-    # Choosing among conflicting embedded creation dates must not replace an
-    # unrelated filesystem creation timestamp with the capture timestamp.
-    if timezone_correction_active:
-        for metadata_key, groups, tag_name, raw_value in records:
-            if tag_name != "FileCreateDate":
-                continue
-            try:
-                parsed = parse_complete_metadata_datetime(raw_value)
-            except ValueError:
-                parsed = None
-            if parsed is None:
-                continue
-            local_datetime, _ = parsed
-            expected_local = local_datetime + effective_correction_delta
-            expected_offset = get_unambiguous_timezone_offset(
-                expected_local,
-                classification_timezone,
+    # Align the existing system creation time to the absolute final
+    # selected capture timestamp. The preferred offset comes from the
+    # chosen metadata when it is compatible with the selected timezone;
+    # otherwise an unambiguous timezone-database offset is used.
+    if align_system_times:
+        expected_offset = resolve_system_timestamp_offset(
+            selected_corrected_datetime,
+            classification_timezone,
+            preferred_system_offset_minutes,
+        )
+        if expected_offset is None:
+            skipped.add(
+                "FileCreateDate (ambiguous selected-date UTC offset)"
             )
-            expected_text = format_complete_datetime(
-                raw_value,
-                expected_local,
+        else:
+            expected = (
+                selected_corrected_datetime,
                 expected_offset,
             )
-            add_correction_operation(
-                operations,
-                skipped,
-                {
-                    "target": "FileCreateDate",
-                    "value": expected_text,
-                    "kind": "datetime",
-                    "expected": (expected_local, expected_offset),
-                    "tag_name": tag_name,
-                    "source": metadata_key,
-                },
-            )
+            for metadata_key, groups, tag_name, raw_value in records:
+                if tag_name != "FileCreateDate":
+                    continue
+                try:
+                    parsed = parse_complete_metadata_datetime(raw_value)
+                except ValueError:
+                    parsed = None
+                if parsed is None:
+                    skipped.add(
+                        f"{metadata_key} (invalid FileCreateDate)"
+                    )
+                    continue
+                if parsed == expected:
+                    continue
+                add_correction_operation(
+                    operations,
+                    skipped,
+                    {
+                        "target": "FileCreateDate",
+                        "value": format_complete_datetime(
+                            raw_value,
+                            selected_corrected_datetime,
+                            expected_offset,
+                        ),
+                        "kind": "datetime",
+                        "expected": expected,
+                        "tag_name": tag_name,
+                        "source": metadata_key,
+                    },
+                )
 
     return list(operations.values()), skipped
 
@@ -1157,8 +1215,10 @@ def update_corrected_copy_metadata(
     selected_corrected_datetime,
     classification_timezone,
     conflicting_date_values=None,
+    align_system_times=False,
+    preferred_system_offset_minutes=None,
 ):
-    """Correct writable metadata and applicable system times in a copy."""
+    """Correct metadata and align supported system times in a copy."""
     source_metadata = read_correction_metadata(metadata_reader, source_file)
     operations, plan_skipped = build_correction_operations(
         source_metadata,
@@ -1166,6 +1226,8 @@ def update_corrected_copy_metadata(
         selected_corrected_datetime,
         classification_timezone,
         conflicting_date_values,
+        align_system_times,
+        preferred_system_offset_minutes,
     )
     updated, write_skipped = execute_correction_operations(
         metadata_reader,
@@ -1173,24 +1235,36 @@ def update_corrected_copy_metadata(
         operations,
     )
 
-    # FileModifyDate is shifted only for a timezone/DST correction. Date
-    # conflict alignment updates the rejected embedded creation fields but
-    # does not overwrite unrelated filesystem modification semantics.
-    if correction_delta is not None:
-        source_stat = source_file.stat()
-        corrected_mtime_ns = source_stat.st_mtime_ns + int(
-            correction_delta.total_seconds() * 1_000_000_000
+    # FileModifyDate is the most widely consumed system timestamp, so
+    # align it to the absolute final selected capture time rather than
+    # applying a delta to an unrelated source-file modification time.
+    if align_system_times:
+        expected_offset = resolve_system_timestamp_offset(
+            selected_corrected_datetime,
+            classification_timezone,
+            preferred_system_offset_minutes,
         )
-        destination_stat = destination_file.stat()
-        os.utime(
-            destination_file,
-            ns=(destination_stat.st_atime_ns, corrected_mtime_ns),
-        )
-        if destination_file.stat().st_mtime_ns != corrected_mtime_ns:
-            raise OSError(
-                f"could not verify corrected FileModifyDate for '{destination_file}'"
+        if expected_offset is None:
+            plan_skipped.add(
+                "FileModifyDate (ambiguous selected-date UTC offset)"
             )
-        updated.append("FileModifyDate")
+        else:
+            selected_mtime_ns = system_datetime_to_epoch_ns(
+                selected_corrected_datetime,
+                expected_offset,
+            )
+            destination_stat = destination_file.stat()
+            if destination_stat.st_mtime_ns != selected_mtime_ns:
+                os.utime(
+                    destination_file,
+                    ns=(destination_stat.st_atime_ns, selected_mtime_ns),
+                )
+                if destination_file.stat().st_mtime_ns != selected_mtime_ns:
+                    raise OSError(
+                        "could not verify aligned FileModifyDate for "
+                        f"'{destination_file}'"
+                    )
+                updated.append("FileModifyDate")
     return sorted(set(updated)), sorted(set(plan_skipped) | set(write_skipped))
 
 
@@ -1958,6 +2032,8 @@ def copy_file_with_corrected_metadata(
     selected_corrected_datetime,
     classification_timezone,
     conflicting_date_values=None,
+    align_system_times=False,
+    preferred_system_offset_minutes=None,
 ):
     """Copy first, then correct and verify the classified copy in place."""
     destination_file, copied, renamed = copy_file_safely(
@@ -1973,6 +2049,8 @@ def copy_file_with_corrected_metadata(
             selected_corrected_datetime,
             classification_timezone,
             conflicting_date_values,
+            align_system_times,
+            preferred_system_offset_minutes,
         )
     except OSError:
         if copied:
@@ -2086,6 +2164,8 @@ try:
         selected_date_option = None
         timezone_correction_delta = None
         conflicting_date_values_by_file = {}
+        date_conflict_resolved = False
+        preferred_system_offset_minutes = None
 
         for same_stem_file in same_stem_files:
             try:
@@ -2254,7 +2334,9 @@ try:
                 print()
                 break
 
-            # Remember the rejected embedded values per file. The copy pass
+            date_conflict_resolved = True
+
+    # Remember the rejected embedded values per file. The copy pass
             # aligns only eligible capture/creation fields carrying one of
             # these values; unrelated timestamps are not overwritten.
             conflicting_date_values_by_file = {
@@ -2292,6 +2374,16 @@ try:
                     selected_file_date[1] - uncorrected_datetime
                 )
 
+        selected_offsets = {
+            offset_record[2]
+            for offset_record in selected_date_option.get(
+                "offset_records",
+                [],
+            )
+        }
+        if len(selected_offsets) == 1:
+            preferred_system_offset_minutes = next(iter(selected_offsets))
+
         for same_stem_file in same_stem_files:
             if same_stem_file in review_reasons:
                 folder_name = UNCLASSIFIED_FOLDER_NAME
@@ -2324,11 +2416,12 @@ try:
                 same_stem_file,
                 set(),
             )
+            align_system_times = (
+                date_conflict_resolved
+                or timezone_correction_delta is not None
+            ) and same_stem_file not in review_reasons
             corrected_copy = (
-                (
-                    timezone_correction_delta is not None
-                    or bool(conflicting_date_values)
-                )
+                (align_system_times or bool(conflicting_date_values))
                 and same_stem_file not in review_reasons
             )
             already_corrected = False
@@ -2354,6 +2447,8 @@ try:
                         selected_file_date[1],
                         classification_timezone,
                         conflicting_date_values,
+                        align_system_times,
+                        preferred_system_offset_minutes,
                     )
                 else:
                     destination_file, copied, renamed = copy_file_safely(

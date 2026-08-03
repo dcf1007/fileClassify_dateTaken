@@ -51,7 +51,9 @@ When distinct complete embedded timestamps are found anywhere in a related group
 
 After the user chooses the authoritative value, the classified copies are normalized to that decision. For each file, eligible capture/creation fields carrying one of the rejected complete timestamps are rewritten to the chosen timestamp. Paired IPTC date/time components are updated together, and derived Composite values follow the corrected underlying fields. Existing inline or separate UTC offsets and writable daylight-saving settings are adjusted for the chosen local date when their representation is unambiguous.
 
-This alignment is deliberately narrower than a blanket metadata rewrite: UTC reference fields, editing/history/resource timestamps, and unrelated filesystem creation or modification times are not replaced merely because a capture-date conflict was resolved. If the chosen value subsequently receives a timezone/daylight-saving correction, both the selected fields and the rejected conflicting fields converge on the final corrected value. As with DST correction, only classified copies are edited; original source files remain unchanged.
+The system timestamps are aligned as part of the same decision. Every classified copy in the related group receives the final chosen value as `FileModifyDate` when its current value differs. Existing `FileCreateDate` is also changed to the same absolute timestamp when the operating system exposes it and ExifTool can write it. The chosen local time is converted with the selected metadata offset when valid, otherwise with the sole unambiguous offset from the configured IANA timezone.
+
+The metadata alignment remains narrower than a blanket rewrite: UTC reference fields and editing/history/resource timestamps are not replaced merely because a capture-date conflict was resolved. If the chosen value subsequently receives a timezone/daylight-saving correction, the metadata fields and system timestamps converge on that final corrected value. Only classified copies are edited; original source files remain unchanged.
 
 ## Timezone and daylight-saving validation
 
@@ -109,7 +111,9 @@ Existing standalone offset fields such as `OffsetTimeOriginal`, `OffsetTimeDigit
 
 Existing camera daylight-saving settings are also updated when ExifTool can write them. This includes direct `DaylightSavings` fields and the active Pentax/Ricoh hometown or destination DST field selected by `WorldTimeLocation`. The raw ON encoding is preserved when present; Canon's documented 60-minute ON representation is used when a zero-valued Canon field must be enabled. Unsupported or read-only maker-note fields are left unchanged and reported.
 
-The filesystem `FileModifyDate` is set from the source file's timestamp plus the approved correction on every corrected copy. This includes groups classified from the system fallback and makes repeated runs idempotent. `FileCreateDate` is also corrected when the operating system exposes it and ExifTool can write it.
+When a date conflict is resolved or a timezone/daylight-saving correction is accepted, `FileModifyDate` is set to the absolute final chosen timestamp rather than calculated from the source file's previous modification time. `FileCreateDate` is set to the same timestamp when the platform exposes it and ExifTool can write it. Values already equal to the final timestamp are left untouched. This keeps software that relies on filesystem dates consistent with the metadata decision and remains idempotent across repeated runs.
+
+An absolute filesystem timestamp requires one UTC offset. The script prefers the offset carried by the chosen metadata when it is valid for the configured timezone. Otherwise it uses the timezone database when exactly one offset is valid. During an unresolved repeated-hour ambiguity, system-time alignment is reported as skipped rather than silently choosing the wrong instant.
 
 After writing, the script reads the classified copy back and verifies writable metadata semantically. If a newly created copy cannot be corrected safely, it is removed. After correction, collision candidates are compared again so repeated runs recognize an existing corrected output rather than retaining an unnecessary numbered duplicate.
 
