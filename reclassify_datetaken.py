@@ -69,12 +69,12 @@ EXIFTOOL_TAGS = [
     "File:FileType",
     "File:MIMEType",
     # Generic camera daylight-saving configuration used by several makers.
-    "DaylightSavings#",
+    "DaylightSavings",
     # Pentax/Ricoh travel profiles. WorldTimeLocation selects the active
     # Hometown or Destination profile; no Make/Model dispatch is required.
-    "WorldTimeLocation#",
-    "HometownDST#",
-    "DestinationDST#",
+    "WorldTimeLocation",
+    "HometownDST",
+    "DestinationDST",
     "HometownCity",
     "DestinationCity",
     # Standard and maker-note UTC-offset context.
@@ -138,32 +138,46 @@ ASSOCIATED_OFFSET_TAGS = {
 
 # Camera-global timezone/DST configuration has narrower write scope than
 # timestamp-associated offsets: it is normalized only in primary or derivative
-# image/video files, never in sidecars. Pentax/Ricoh active-profile semantics
-# are derived from tag relationships rather than camera-brand conditionals.
+# image/video files, never in sidecars. Selector-driven profiles are represented
+# declaratively so review and correction use the same relationship data.
 DIRECT_DST_TAGS = {"DaylightSavings"}
-PROFILE_SELECTOR_TAG = "WorldTimeLocation"
+TIMEZONE_PROFILE_POLICIES = (
+    {
+        "selector_tag": "WorldTimeLocation",
+        "profiles": (
+            {
+                "name": "Hometown",
+                "selector_values": ("0", "home", "hometown"),
+                "dst_tag": "HometownDST",
+                "context_tags": ("HometownCity",),
+            },
+            {
+                "name": "Destination",
+                "selector_values": ("1", "destination", "travel"),
+                "dst_tag": "DestinationDST",
+                "context_tags": ("DestinationCity",),
+            },
+        ),
+    },
+)
+PROFILE_SELECTOR_TAGS = {policy["selector_tag"] for policy in TIMEZONE_PROFILE_POLICIES}
 PROFILE_DST_TAGS = {
-    "Hometown": "HometownDST",
-    "Destination": "DestinationDST",
+    profile["dst_tag"]
+    for policy in TIMEZONE_PROFILE_POLICIES
+    for profile in policy["profiles"]
 }
-PROFILE_CITY_TAGS = {
-    "Hometown": "HometownCity",
-    "Destination": "DestinationCity",
+PROFILE_CONTEXT_TAGS = {
+    tag_name
+    for policy in TIMEZONE_PROFILE_POLICIES
+    for profile in policy["profiles"]
+    for tag_name in profile["context_tags"]
 }
 ASSOCIATED_OFFSET_FIELDS = set(ASSOCIATED_OFFSET_TAGS.values())
 GLOBAL_OFFSET_TAGS = {"TimeZoneOffset", "TimeZone", "TimeOffset"}
 OFFSET_CONTEXT_TAGS = ASSOCIATED_OFFSET_FIELDS | GLOBAL_OFFSET_TAGS
-DISPLAY_CONTEXT_TAGS = {
-    "TimeZoneCity",
-    "HometownCity",
-    "DestinationCity",
-    PROFILE_SELECTOR_TAG,
-}
+DISPLAY_CONTEXT_TAGS = {"TimeZoneCity"} | PROFILE_SELECTOR_TAGS | PROFILE_CONTEXT_TAGS
 TIME_CONTEXT_TAGS = (
-    DIRECT_DST_TAGS
-    | set(PROFILE_DST_TAGS.values())
-    | OFFSET_CONTEXT_TAGS
-    | DISPLAY_CONTEXT_TAGS
+    DIRECT_DST_TAGS | PROFILE_DST_TAGS | OFFSET_CONTEXT_TAGS | DISPLAY_CONTEXT_TAGS
 )
 UTC_REFERENCE_TAGS = {
     "DateTimeUTC",
@@ -277,18 +291,6 @@ class ParsedMetadataDateTime:
 # canonical values used by the classifier. Raw syntax is retained for later
 # formatting, while local wall-clock components and UTC offsets remain separate.
 # Parsing never silently converts a local timestamp into another timezone.
-
-
-def clean_input_path(raw_path):
-    """Remove one matching pair of drag-and-drop quotes."""
-    cleaned_path = raw_path.strip()
-    if (
-        len(cleaned_path) >= 2
-        and cleaned_path[0] == cleaned_path[-1]
-        and cleaned_path[0] in {'"', "'"}
-    ):
-        cleaned_path = cleaned_path[1:-1]
-    return Path(cleaned_path).expanduser()
 
 
 def iterate_exiftool_values(metadata):
@@ -450,22 +452,51 @@ def parse_daylight_saving_value(metadata_value):
         return None
 
 
-def parse_active_world_time_profile(metadata_value):
-    """Return the active Pentax/Ricoh world-time profile, when recognizable."""
-    if isinstance(metadata_value, (int, float)):
-        numeric_value = int(metadata_value)
-        if numeric_value == 0:
-            return "Hometown"
-        if numeric_value == 1:
-            return "Destination"
-        return None
+def resolve_active_timezone_profiles(values_by_tag):
+    """
+    Resolve unambiguous selector-driven timezone profiles from policy data.
 
-    value_text = str(metadata_value).strip().casefold()
-    if value_text in {"0", "home", "hometown"}:
-        return "Hometown"
-    if value_text in {"1", "destination", "travel"}:
-        return "Destination"
-    return None
+    The returned tuples contain selector tag, active profile name, active DST tag,
+    and profile context tags. Unknown or contradictory selector values are ignored
+    rather than guessed. This shared resolver is used by both metadata review and
+    metadata correction.
+    """
+    active_profiles = []
+    for policy in TIMEZONE_PROFILE_POLICIES:
+        recognized_profile_names = set()
+        for selector_record in values_by_tag.get(policy["selector_tag"], []):
+            raw_selector_value = selector_record[-1]
+            if isinstance(raw_selector_value, (int, float)):
+                numeric_value = float(raw_selector_value)
+                normalized_value = (
+                    str(int(numeric_value))
+                    if numeric_value.is_integer()
+                    else str(numeric_value)
+                )
+            else:
+                normalized_value = str(raw_selector_value).strip().casefold()
+
+            for profile in policy["profiles"]:
+                if normalized_value in profile["selector_values"]:
+                    recognized_profile_names.add(profile["name"])
+
+        if len(recognized_profile_names) != 1:
+            continue
+
+        active_name = next(iter(recognized_profile_names))
+        active_profile = next(
+            profile for profile in policy["profiles"] if profile["name"] == active_name
+        )
+        active_profiles.append(
+            (
+                policy["selector_tag"],
+                active_profile["name"],
+                active_profile["dst_tag"],
+                active_profile["context_tags"],
+            )
+        )
+
+    return active_profiles
 
 
 def format_offset(offset_minutes):
@@ -497,6 +528,8 @@ def format_complete_datetime(original_value, local_datetime, offset_minutes=None
         f"{local_datetime.hour:02d}:{local_datetime.minute:02d}:"
         f"{local_datetime.second:02d}"
     )
+    # Fractional precision is intentionally field-local. Threshold consensus
+    # compares whole seconds, while correction preserves each existing suffix.
     fraction = date_match.group("fraction")
     if fraction is not None:
         formatted += f".{fraction}"
@@ -533,6 +566,7 @@ def format_time_only(original_value, local_datetime, offset_minutes=None):
         f"{local_datetime.hour:02d}:{local_datetime.minute:02d}:"
         f"{local_datetime.second:02d}"
     )
+    # As with complete timestamps, preserve the source field's own fraction.
     fraction = time_match.group("fraction")
     if fraction is not None:
         formatted += f".{fraction}"
@@ -632,26 +666,6 @@ def timezone_states_for_local_time(local_datetime, classification_timezone):
     return states
 
 
-def get_daylight_saving_adjustment(classification_timezone, year):
-    """
-    Return the largest daylight-saving adjustment used during one year.
-
-    The value comes from timezone data rather than an assumed one-hour change;
-    historical or regional rules may use another adjustment.
-    """
-    current_date = datetime(year, 1, 1, 12)
-    end_date = datetime(year + 1, 1, 1, 12)
-    largest_delta = timedelta(0)
-    while current_date < end_date:
-        dst_delta = current_date.replace(
-            tzinfo=classification_timezone
-        ).dst() or timedelta(0)
-        if abs(dst_delta) > abs(largest_delta):
-            largest_delta = dst_delta
-        current_date += timedelta(days=1)
-    return largest_delta
-
-
 def derive_utc_offset_from_timestamp_pair(local_datetime, utc_datetime):
     """
     Derive a plausible civil offset from matching local and UTC timestamps.
@@ -674,56 +688,6 @@ def resolve_unambiguous_timezone_state(local_datetime, classification_timezone):
     """Return the sole valid timezone state for a local time, or None."""
     states = timezone_states_for_local_time(local_datetime, classification_timezone)
     return states[0] if len(states) == 1 else None
-
-
-def resolve_unambiguous_timezone_offset(local_datetime, classification_timezone):
-    """Return the sole valid UTC offset for a local time, or None."""
-    state = resolve_unambiguous_timezone_state(local_datetime, classification_timezone)
-    return state[1] if state is not None else None
-
-
-def resolve_filesystem_timestamp_offset(
-    local_datetime,
-    classification_timezone,
-    preferred_offset_minutes=None,
-):
-    """
-    Resolve one absolute offset for a copied file's modification time.
-
-    A unique offset attached to the selected consensus may disambiguate a DST
-    fold if it is valid for the zone. Otherwise only a single zone-database
-    result is accepted; ambiguous values are skipped instead of guessed.
-    """
-    valid_offsets = {
-        state[1]
-        for state in timezone_states_for_local_time(
-            local_datetime,
-            classification_timezone,
-        )
-    }
-    if preferred_offset_minutes in valid_offsets:
-        return preferred_offset_minutes
-    if len(valid_offsets) == 1:
-        return next(iter(valid_offsets))
-    return None
-
-
-def local_datetime_to_epoch_nanoseconds(local_datetime, offset_minutes):
-    """
-    Convert one local datetime and explicit offset to Unix nanoseconds.
-
-    Integer arithmetic avoids the rounding that can occur when a filesystem
-    timestamp is constructed through a floating-point POSIX timestamp.
-    """
-    aware_datetime = local_datetime.replace(
-        tzinfo=timezone(timedelta(minutes=offset_minutes))
-    )
-    utc_datetime = aware_datetime.astimezone(timezone.utc)
-    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-    delta = utc_datetime - epoch
-    return (
-        delta.days * 86400 + delta.seconds
-    ) * 1_000_000_000 + delta.microseconds * 1000
 
 
 def format_labels_by_file(records):
@@ -876,16 +840,13 @@ def read_related_files_metadata(metadata_reader, primary_stem, related_files):
         # file can still be routed to review after an ExifTool failure. MIME
         # metadata, when present, is incorporated below.
         file_record = {
-            "metadata": {},
             "records": [],
             "capture_candidates": [],
             "timezone_context": [],
             "utc_references": [],
-            "file_modify_candidate": None,
             "is_image": extension_is_image,
             "is_video": extension_is_video,
             "is_capture_media": extension_is_image or extension_is_video,
-            "is_primary_stem": is_primary_stem,
         }
 
         # --------------------------------------------------------------------
@@ -922,8 +883,6 @@ def read_related_files_metadata(metadata_reader, primary_stem, related_files):
             continue
 
         metadata = metadata_results[0] if metadata_results else {}
-        file_record["metadata"] = metadata
-
         mime_type = None
         invalid_capture_values = []
         for metadata_key, groups, tag_name, raw_value in iterate_exiftool_values(
@@ -970,11 +929,6 @@ def read_related_files_metadata(metadata_reader, primary_stem, related_files):
             if parsed is None:
                 continue
 
-            family_key = tuple(
-                group_name
-                for group_name in groups
-                if not group_name.casefold().startswith("copy")
-            )
             # Only complete values become candidates. Complete Composite
             # timestamps are valid evidence but are marked read-only; their
             # existing writable source components are normalized later.
@@ -985,13 +939,6 @@ def read_related_files_metadata(metadata_reader, primary_stem, related_files):
                         "datetime": parsed.local_datetime,
                         "source": metadata_key,
                         "offset_minutes": parsed.utc_offset_minutes,
-                        "tag_name": tag_name,
-                        "groups": groups,
-                        "raw_value": raw_value,
-                        "writable_target": get_metadata_write_target(
-                            groups,
-                            tag_name,
-                        ),
                         "kind": (
                             "composite"
                             if groups and groups[0] == "Composite"
@@ -1067,19 +1014,14 @@ def read_related_files_metadata(metadata_reader, primary_stem, related_files):
                         parsed_modify is not None
                         and parsed_modify.local_datetime is not None
                     ):
-                        file_record["file_modify_candidate"] = {
-                            "date_type": 0,
-                            "datetime": parsed_modify.local_datetime,
-                            "source": "File:System:FileModifyDate",
-                            "offset_minutes": None,
-                            "tag_name": "FileModifyDate",
-                            "groups": ["File", "System"],
-                            "raw_value": modification_value,
-                            "writable_target": None,
-                            "kind": "file_modify",
-                        }
                         file_record["capture_candidates"].append(
-                            file_record["file_modify_candidate"]
+                            {
+                                "date_type": 0,
+                                "datetime": parsed_modify.local_datetime,
+                                "source": "File:System:FileModifyDate",
+                                "offset_minutes": None,
+                                "kind": "file_modify",
+                            }
                         )
 
         related_files_metadata["files"][source_file] = file_record
@@ -1169,9 +1111,10 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
     # BUILD ONE DISPLAY/DECISION OPTION FOR EACH THRESHOLD CLUSTER
     #
     # The representative must be a timestamp that actually exists in metadata.
-    # Counting distinct (file, field) sources avoids allowing duplicate ExifTool
-    # extraction instances to inflate support. Embedded metadata wins a support
-    # tie against FileModifyDate; the earliest value resolves any remaining tie.
+    # Independent files count first; multiple synonymous or Composite paths from
+    # one file do not create extra votes. Embedded metadata then outranks a
+    # FileModifyDate-only value, direct complete fields outrank calculated Composite
+    # values, and the earliest timestamp resolves the final deterministic tie.
     #
     # Only embedded offsets are retained. Even if a future read path accidentally
     # attaches an offset to a FileModifyDate candidate, this consensus boundary
@@ -1191,19 +1134,28 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
             key=lambda candidate_datetime: (
                 -len(
                     {
-                        (source_file, candidate["source"])
-                        for source_file, candidate in records_by_exact_datetime[
+                        source_file
+                        for source_file, _ in records_by_exact_datetime[
                             candidate_datetime
                         ]
                     }
                 ),
                 -len(
                     {
-                        (source_file, candidate["source"])
+                        source_file
                         for source_file, candidate in records_by_exact_datetime[
                             candidate_datetime
                         ]
                         if candidate["kind"] != "file_modify"
+                    }
+                ),
+                -len(
+                    {
+                        source_file
+                        for source_file, candidate in records_by_exact_datetime[
+                            candidate_datetime
+                        ]
+                        if candidate["kind"] == "complete"
                     }
                 ),
                 candidate_datetime,
@@ -1246,11 +1198,7 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
         return {
             "datetime": None,
             "date_type": None,
-            "sources": [],
             "offset_records": [],
-            "conflict_resolved": False,
-            "rejected_datetimes_by_file": {},
-            "timezone_correction": None,
             "preserve_timezone_metadata": False,
             "preferred_utc_offset_minutes": None,
         }
@@ -1258,8 +1206,7 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
     # ------------------------------------------------------------------------
     # ACCEPT ONE THRESHOLD CLUSTER OR ASK THE USER TO RESOLVE MULTIPLE CLUSTERS
     # ------------------------------------------------------------------------
-    conflict_resolved = len(consensus_options) > 1
-    if not conflict_resolved:
+    if len(consensus_options) == 1:
         selected_datetime, selected_option = next(iter(consensus_options.items()))
     else:
         sorted_options = sorted(consensus_options.items())
@@ -1308,22 +1255,6 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
                 break
             print("Invalid selection. Enter one of the listed numbers.")
 
-    # Rejected embedded/Composite values are those outside the selected threshold
-    # cluster. Different seconds inside the selected cluster are supporting
-    # evidence, not a conflict. FileModifyDate is excluded because it is corrected
-    # as a filesystem value rather than as an embedded ExifTool target.
-    selected_member_datetimes = selected_option["member_datetimes"]
-    rejected_datetimes_by_file = {}
-    for source_file, candidates in candidates_by_file.items():
-        rejected_values = {
-            candidate["datetime"]
-            for candidate in candidates
-            if candidate["kind"] != "file_modify"
-            and candidate["datetime"] not in selected_member_datetimes
-        }
-        if rejected_values:
-            rejected_datetimes_by_file[source_file] = rejected_values
-
     # A unique embedded offset attached anywhere in the chosen cluster is retained
     # as the preferred interpretation of an ambiguous autumn fold and as the
     # absolute basis for the FileModifyDate written to copied media. Filesystem
@@ -1340,11 +1271,7 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
     return {
         "datetime": selected_datetime,
         "date_type": selected_option["date_type"],
-        "sources": selected_option["sources"],
         "offset_records": selected_option["offset_records"],
-        "conflict_resolved": conflict_resolved,
-        "rejected_datetimes_by_file": rejected_datetimes_by_file,
-        "timezone_correction": None,
         "preserve_timezone_metadata": False,
         "preferred_utc_offset_minutes": preferred_offset,
     }
@@ -1431,32 +1358,26 @@ def review_and_correct_timezone_and_dst(
             if state is not None:
                 dst_records.append((source_file, source_name, state))
 
-        active_profiles = {
-            parse_active_world_time_profile(raw_value)
-            for _, raw_value in values_by_tag.get(PROFILE_SELECTOR_TAG, [])
-        }
-        active_profiles.discard(None)
-        if len(active_profiles) == 1:
-            active_profile = next(iter(active_profiles))
-            active_dst_tag = PROFILE_DST_TAGS[active_profile]
-            active_city_tag = PROFILE_CITY_TAGS[active_profile]
-
+        for (
+            selector_tag,
+            active_profile,
+            active_dst_tag,
+            context_tags,
+        ) in resolve_active_timezone_profiles(values_by_tag):
             for source_name, raw_value in values_by_tag.get(active_dst_tag, []):
                 state = parse_daylight_saving_value(raw_value)
                 if state is not None:
                     dst_records.append((source_file, source_name, state))
 
-            for source_name, raw_value in values_by_tag.get(active_city_tag, []):
-                display_records.append(
-                    (
-                        source_file,
-                        f"{source_name}={raw_value} ({active_profile})",
+            for context_tag in context_tags:
+                for source_name, raw_value in values_by_tag.get(context_tag, []):
+                    display_records.append(
+                        (
+                            source_file,
+                            f"{source_name}={raw_value} ({active_profile})",
+                        )
                     )
-                )
-            for source_name, raw_value in values_by_tag.get(
-                PROFILE_SELECTOR_TAG,
-                [],
-            ):
+            for source_name, raw_value in values_by_tag.get(selector_tag, []):
                 display_records.append(
                     (
                         source_file,
@@ -1581,15 +1502,47 @@ def review_and_correct_timezone_and_dst(
     # ------------------------------------------------------------------------
     correction_reasons = {}
     if not valid_states:
-        daylight_adjustment = get_daylight_saving_adjustment(
-            classification_timezone,
-            selected_datetime.year,
-        )
-        if daylight_adjustment != timedelta(0):
-            correction_reasons.setdefault(
-                selected_datetime + daylight_adjustment,
-                [],
-            ).append("move forward across the transition gap")
+        # Find the valid offsets immediately surrounding this nonexistent local
+        # time. Their difference is the real transition gap, including unusual
+        # half-hour or full-day civil-time jumps.
+        offset_before_gap = None
+        offset_after_gap = None
+        for minute_distance in range(1, 2 * 24 * 60 + 1):
+            if offset_before_gap is None:
+                before_offsets = {
+                    state[1]
+                    for state in timezone_states_for_local_time(
+                        selected_datetime - timedelta(minutes=minute_distance),
+                        classification_timezone,
+                    )
+                }
+                if len(before_offsets) == 1:
+                    offset_before_gap = next(iter(before_offsets))
+
+            if offset_after_gap is None:
+                after_offsets = {
+                    state[1]
+                    for state in timezone_states_for_local_time(
+                        selected_datetime + timedelta(minutes=minute_distance),
+                        classification_timezone,
+                    )
+                }
+                if len(after_offsets) == 1:
+                    offset_after_gap = next(iter(after_offsets))
+
+            if offset_before_gap is not None and offset_after_gap is not None:
+                break
+
+        if offset_before_gap is not None and offset_after_gap is not None:
+            gap_adjustment = timedelta(minutes=offset_after_gap - offset_before_gap)
+            corrected_datetime = selected_datetime + gap_adjustment
+            if gap_adjustment > timedelta(0) and timezone_states_for_local_time(
+                corrected_datetime,
+                classification_timezone,
+            ):
+                correction_reasons.setdefault(corrected_datetime, []).append(
+                    "move forward across the actual transition gap"
+                )
     else:
         for observed_offset in sorted(mismatched_offsets):
             for expected_offset in sorted(expected_offsets):
@@ -1600,28 +1553,47 @@ def review_and_correct_timezone_and_dst(
                     f"to UTC{format_offset(expected_offset)}"
                 )
 
-        # A stale DST flag can exist without a usable mismatching offset. Only
-        # when offset-derived options produced no correction do we offer the
-        # timezone database's real yearly DST adjustment. This is weaker evidence
-        # than an attached/derived offset and remains an explicit user choice.
+        # A stale DST flag can exist without a usable mismatching offset. In
+        # that case, find the nearest real zone state matching the recorded switch
+        # and use the offset difference between that state and the selected state.
         if not correction_reasons and len(recorded_dst_states) == 1:
             if len(expected_dst_states) == 1 and mismatched_dst:
-                expected_dst = next(iter(expected_dst_states))
                 recorded_dst = next(iter(recorded_dst_states))
-                daylight_adjustment = get_daylight_saving_adjustment(
-                    classification_timezone,
-                    selected_datetime.year,
-                )
-                if daylight_adjustment != timedelta(0):
-                    correction_delta = (
-                        daylight_adjustment
-                        if expected_dst and not recorded_dst
-                        else -daylight_adjustment
+                expected_offset = next(iter(expected_offsets))
+                recorded_offset = None
+
+                for day_distance in range(1, 367):
+                    nearby_offsets = set()
+                    for direction in (-1, 1):
+                        nearby_datetime = selected_datetime + timedelta(
+                            days=direction * day_distance
+                        )
+                        for (
+                            dst_state,
+                            offset_minutes,
+                            _,
+                        ) in timezone_states_for_local_time(
+                            nearby_datetime,
+                            classification_timezone,
+                        ):
+                            if dst_state == recorded_dst:
+                                nearby_offsets.add(offset_minutes)
+                    if len(nearby_offsets) == 1:
+                        recorded_offset = next(iter(nearby_offsets))
+                        break
+
+                if recorded_offset is not None:
+                    correction_delta = timedelta(
+                        minutes=expected_offset - recorded_offset
                     )
-                    correction_reasons.setdefault(
-                        selected_datetime + correction_delta,
-                        [],
-                    ).append("correct the contradictory camera DST setting")
+                    if correction_delta != timedelta(0):
+                        correction_reasons.setdefault(
+                            selected_datetime + correction_delta,
+                            [],
+                        ).append(
+                            "correct the contradictory camera DST setting using "
+                            "the nearest matching timezone state"
+                        )
 
     if not correction_reasons:
         print(
@@ -1663,7 +1635,6 @@ def review_and_correct_timezone_and_dst(
         print()
         capture_time_consensus["datetime"] = corrected_datetime
         capture_time_consensus["date_type"] = 2
-        capture_time_consensus["timezone_correction"] = correction_delta
         capture_time_consensus["preserve_timezone_metadata"] = False
         return
 
@@ -1703,7 +1674,6 @@ def review_and_correct_timezone_and_dst(
             correction_delta = corrected_datetime - selected_datetime
             capture_time_consensus["datetime"] = corrected_datetime
             capture_time_consensus["date_type"] = 2
-            capture_time_consensus["timezone_correction"] = correction_delta
             capture_time_consensus["preserve_timezone_metadata"] = False
 
             correction_key = build_automatic_correction_key(
@@ -1791,21 +1761,6 @@ def format_metadata_offset_value(tag_name, original_value, offset_minutes):
     if SIGNED_OFFSET_PATTERN.search(original_text):
         return SIGNED_OFFSET_PATTERN.sub(replacement, original_text, count=1)
     return replacement
-
-
-def raw_dst_write_value(groups, original_value, expected_dst):
-    """Preserve known maker encodings, including Canon's 60-minute ON value."""
-    if not expected_dst:
-        return "0"
-    try:
-        numeric_value = int(float(str(original_value).strip()))
-    except ValueError:
-        numeric_value = 0
-    if numeric_value:
-        return str(numeric_value)
-    if any(group_name.casefold().startswith("canon") for group_name in groups):
-        return "60"
-    return "1"
 
 
 def operation_matches(operation, actual_values):
@@ -1910,27 +1865,26 @@ def update_copied_file_metadata_and_system_times(
     # This offset still determines the absolute FileModifyDate written to copied
     # media. It is used to normalize embedded timezone metadata only when review
     # did not explicitly preserve contradictory evidence.
-    expected_offset = resolve_filesystem_timestamp_offset(
-        selected_datetime,
-        classification_timezone,
-        capture_time_consensus.get("preferred_utc_offset_minutes"),
-    )
+    valid_filesystem_offsets = {
+        state[1]
+        for state in timezone_states_for_local_time(
+            selected_datetime,
+            classification_timezone,
+        )
+    }
+    preferred_offset = capture_time_consensus.get("preferred_utc_offset_minutes")
+    if preferred_offset in valid_filesystem_offsets:
+        expected_offset = preferred_offset
+    elif len(valid_filesystem_offsets) == 1:
+        expected_offset = next(iter(valid_filesystem_offsets))
+    else:
+        expected_offset = None
 
-    # Keep duplicate values scoped to their complete ExifTool family path.
-    # ``values_by_tag`` is also built for context fields whose semantics are
-    # intentionally independent of one storage family. Copy* extraction labels
-    # are ignored because they are duplicate-instance markers, not write groups.
-    records_by_family_tag = {}
+    # Context fields are indexed by tag because their semantics are independent
+    # of one storage family; complete capture fields are still handled from their
+    # original records so each explicit write target remains available.
     values_by_tag = {}
     for metadata_key, groups, tag_name, raw_value in records:
-        family_key = tuple(
-            group_name
-            for group_name in groups
-            if not group_name.casefold().startswith("copy")
-        )
-        records_by_family_tag.setdefault((family_key, tag_name), []).append(
-            (metadata_key, groups, raw_value)
-        )
         values_by_tag.setdefault(tag_name, []).append((metadata_key, groups, raw_value))
 
     # ------------------------------------------------------------------------
@@ -1996,7 +1950,6 @@ def update_copied_file_metadata_and_system_times(
                 "kind": "datetime",
                 "expected": expected_value,
                 "tag_name": tag_name,
-                "source": metadata_key,
             },
         )
 
@@ -2040,7 +1993,6 @@ def update_copied_file_metadata_and_system_times(
                         "kind": "date",
                         "expected": expected_date,
                         "tag_name": tag_name,
-                        "source": metadata_key,
                     },
                 )
 
@@ -2074,7 +2026,6 @@ def update_copied_file_metadata_and_system_times(
                         "kind": "time",
                         "expected": (selected_datetime.time(), target_offset),
                         "tag_name": tag_name,
-                        "source": metadata_key,
                     },
                 )
 
@@ -2110,7 +2061,6 @@ def update_copied_file_metadata_and_system_times(
                         "kind": "offset",
                         "expected": expected_offset,
                         "tag_name": tag_name,
-                        "source": metadata_key,
                     },
                 )
 
@@ -2153,7 +2103,6 @@ def update_copied_file_metadata_and_system_times(
                             "kind": "offset",
                             "expected": expected_offset,
                             "tag_name": tag_name,
-                            "source": metadata_key,
                         },
                     )
 
@@ -2163,21 +2112,13 @@ def update_copied_file_metadata_and_system_times(
             )
             if expected_state is not None:
                 expected_dst = expected_state[0]
-                active_profiles = {
-                    parse_active_world_time_profile(raw_value)
-                    for _, _, raw_value in values_by_tag.get(
-                        PROFILE_SELECTOR_TAG,
-                        [],
-                    )
-                }
-                active_profiles.discard(None)
-                active_profile_tag = None
-                if len(active_profiles) == 1:
-                    active_profile_tag = PROFILE_DST_TAGS[next(iter(active_profiles))]
-
                 dst_tags = set(DIRECT_DST_TAGS)
-                if active_profile_tag is not None:
-                    dst_tags.add(active_profile_tag)
+                dst_tags.update(
+                    active_dst_tag
+                    for _, _, active_dst_tag, _ in (
+                        resolve_active_timezone_profiles(values_by_tag)
+                    )
+                )
 
                 for tag_name in sorted(dst_tags):
                     for metadata_key, groups, raw_value in values_by_tag.get(
@@ -2187,27 +2128,40 @@ def update_copied_file_metadata_and_system_times(
                         write_target = get_metadata_write_target(
                             groups,
                             tag_name,
-                            raw=True,
                         )
                         if write_target is None:
                             continue
                         actual_dst = parse_daylight_saving_value(raw_value)
                         if actual_dst == expected_dst:
                             continue
+
+                        # Write through ExifTool's normal PrintConv path. Preserve
+                        # the vocabulary already exposed for this tag while letting
+                        # ExifTool perform the tag-specific inverse conversion.
+                        dst_vocabulary = str(raw_value).strip().casefold()
+                        if dst_vocabulary in {"yes", "no"}:
+                            target_dst_value = "Yes" if expected_dst else "No"
+                        elif dst_vocabulary in {"enabled", "disabled"}:
+                            target_dst_value = "Enabled" if expected_dst else "Disabled"
+                        elif dst_vocabulary in {
+                            "daylight saving",
+                            "standard time",
+                        }:
+                            target_dst_value = (
+                                "Daylight Saving" if expected_dst else "Standard Time"
+                            )
+                        else:
+                            target_dst_value = "On" if expected_dst else "Off"
+
                         add_correction_operation(
                             operations,
                             skipped,
                             {
                                 "target": write_target,
-                                "value": raw_dst_write_value(
-                                    groups,
-                                    raw_value,
-                                    expected_dst,
-                                ),
+                                "value": target_dst_value,
                                 "kind": "dst",
                                 "expected": expected_dst,
                                 "tag_name": tag_name,
-                                "source": metadata_key,
                             },
                         )
     elif not preserve_timezone_metadata:
@@ -2290,10 +2244,15 @@ def update_copied_file_metadata_and_system_times(
         if expected_offset is None:
             skipped.add("FileModifyDate (ambiguous consensus UTC offset)")
         else:
-            selected_mtime_ns = local_datetime_to_epoch_nanoseconds(
-                selected_datetime,
-                expected_offset,
+            aware_selected_datetime = selected_datetime.replace(
+                tzinfo=timezone(timedelta(minutes=expected_offset))
             )
+            selected_utc_datetime = aware_selected_datetime.astimezone(timezone.utc)
+            epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+            epoch_delta = selected_utc_datetime - epoch
+            selected_mtime_ns = (
+                epoch_delta.days * 86400 + epoch_delta.seconds
+            ) * 1_000_000_000 + epoch_delta.microseconds * 1000
             if copied_file.stat().st_mtime_ns != selected_mtime_ns:
                 os.utime(
                     copied_file,
@@ -2515,9 +2474,16 @@ def main():
     # ------------------------------------------------------------------------
     # VALIDATE SOURCE AND OUTPUT DIRECTORIES
     # ------------------------------------------------------------------------
-    source_directory = clean_input_path(
-        input("Please write (or drag) the source directory path: ")
-    )
+    raw_source_path = input(
+        "Please write (or drag) the source directory path: "
+    ).strip()
+    if (
+        len(raw_source_path) >= 2
+        and raw_source_path[0] == raw_source_path[-1]
+        and raw_source_path[0] in {'"', "'"}
+    ):
+        raw_source_path = raw_source_path[1:-1]
+    source_directory = Path(raw_source_path).expanduser()
     if not source_directory.exists() or not source_directory.is_dir():
         print(f"Error: source directory is invalid: '{source_directory}'")
         input("Press Enter to exit")
