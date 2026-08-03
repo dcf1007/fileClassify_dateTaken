@@ -1,0 +1,243 @@
+name: Refine code readability
+
+on:
+  pull_request:
+    branches:
+      - agent/replace-pillow-pyexiftool
+    paths:
+      - .github/tmp/run-code-readability-refinement
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  refine-and-validate:
+    runs-on: ubuntu-latest
+    env:
+      ORIGINAL_HEAD: 6a7672affb0403ceace2c20c042c00e4e53ab91d
+      FEATURE_BRANCH: agent/replace-pillow-pyexiftool
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/replace-pillow-pyexiftool
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Assemble and apply focused cleanup
+        shell: bash
+        run: |
+          cat \
+            .github/tmp/refine_code.part1 \
+            .github/tmp/refine_code.part2 \
+            .github/tmp/refine_code.part3 \
+            > /tmp/refine_code.py
+          python -m py_compile /tmp/refine_code.py
+          cp reclassify_datetaken.py /tmp/reclassify_before.py
+          python /tmp/refine_code.py
+
+      - name: Install validation tools
+        shell: bash
+        run: |
+          python -m pip install -r requirements.txt black==24.10.0
+
+      - name: Format and compare correction behavior
+        shell: bash
+        run: |
+          python -m black reclassify_datetaken.py
+          python -m py_compile reclassify_datetaken.py
+          git diff --check
+
+          python - <<'PY'
+          import ast
+          import importlib.util
+          from datetime import datetime, timedelta
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          def load_module(name, path):
+              spec = importlib.util.spec_from_file_location(name, path)
+              module = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(module)
+              return module
+
+          before = load_module('before_cleanup', '/tmp/reclassify_before.py')
+          after = load_module('after_cleanup', 'reclassify_datetaken.py')
+          berlin = ZoneInfo('Europe/Berlin')
+
+          def normalize_plan(result):
+              operations, skipped = result
+              normalized_operations = sorted(
+                  (
+                      operation['target'],
+                      str(operation['value']),
+                      operation['kind'],
+                      repr(operation['expected']),
+                      operation['tag_name'],
+                      operation['source'],
+                  )
+                  for operation in operations
+              )
+              return normalized_operations, sorted(skipped)
+
+          cases = [
+              (
+                  {
+                      'EXIF:ExifIFD:DateTimeOriginal':
+                          '2024:07:15 12:00:00',
+                  },
+                  timedelta(hours=1),
+                  datetime(2024, 7, 15, 13, 0, 0),
+                  set(),
+                  False,
+                  None,
+              ),
+              (
+                  {
+                      'XMP:XMP-exif:DateTimeOriginal':
+                          '2024-07-15T12:00:00+01:00',
+                  },
+                  timedelta(hours=1),
+                  datetime(2024, 7, 15, 13, 0, 0),
+                  set(),
+                  False,
+                  None,
+              ),
+              (
+                  {
+                      'EXIF:ExifIFD:DateTimeOriginal':
+                          '2024:07:15 12:00:00',
+                      'EXIF:ExifIFD:OffsetTimeOriginal': '+01:00',
+                  },
+                  timedelta(hours=1),
+                  datetime(2024, 7, 15, 13, 0, 0),
+                  set(),
+                  False,
+                  None,
+              ),
+              (
+                  {
+                      'IPTC:IPTC:DateCreated': '2024:03:31',
+                      'IPTC:IPTC:TimeCreated': '01:30:00',
+                  },
+                  timedelta(hours=1),
+                  datetime(2024, 3, 31, 3, 30, 0),
+                  set(),
+                  False,
+                  None,
+              ),
+              (
+                  {
+                      'EXIF:ExifIFD:DateTimeOriginal':
+                          '2024:01:15 12:00:00',
+                      'EXIF:Canon:DaylightSavings': 0,
+                      'File:System:FileCreateDate':
+                          '2020:01:02 03:04:05+01:00',
+                  },
+                  None,
+                  datetime(2024, 7, 15, 12, 0, 0),
+                  {datetime(2024, 1, 15, 12, 0, 0)},
+                  True,
+                  120,
+              ),
+              (
+                  {
+                      'EXIF:Pentax:WorldTimeLocation': 1,
+                      'EXIF:Pentax:HometownDST': 0,
+                      'EXIF:Pentax:DestinationDST': 0,
+                      'EXIF:ExifIFD:DateTimeOriginal':
+                          '2024:07:15 12:00:00',
+                  },
+                  timedelta(hours=1),
+                  datetime(2024, 7, 15, 13, 0, 0),
+                  set(),
+                  False,
+                  None,
+              ),
+          ]
+
+          for case in cases:
+              metadata, delta, selected, conflicts, align_system, offset = case
+              before_plan = before.build_correction_operations(
+                  metadata,
+                  delta,
+                  selected,
+                  berlin,
+                  conflicts,
+                  align_system,
+                  offset,
+              )
+              after_plan = after.build_correction_operations(
+                  metadata,
+                  delta,
+                  selected,
+                  berlin,
+                  conflicts,
+                  align_system,
+                  offset,
+              )
+              assert normalize_plan(before_plan) == normalize_plan(after_plan), case
+
+          source = Path('reclassify_datetaken.py').read_text(encoding='utf-8')
+          tree = ast.parse(source)
+          functions = {
+              node.name: node
+              for node in tree.body
+              if isinstance(node, ast.FunctionDef)
+          }
+          expected_helpers = {
+              'index_correction_metadata',
+              'plan_complete_timestamp_corrections',
+              'plan_partial_timestamp_corrections',
+              'plan_offset_corrections',
+              'plan_dst_setting_corrections',
+              'plan_file_create_date_alignment',
+          }
+          assert expected_helpers <= functions.keys()
+          assert all(ast.get_docstring(functions[name]) for name in expected_helpers)
+          planner = functions['build_correction_operations']
+          assert planner.end_lineno - planner.lineno < 100
+          assert 'EXIF_DATE_FORMAT' not in source
+          assert 'params=FILE_MODIFY_DATE_PARAMS' in source
+          assert '" f"' not in source
+          assert '_directory,' not in source
+          assert 'if __name__ == "__main__":\n    raise SystemExit(main())' in source
+          PY
+
+      - name: Commit one clean refinement commit
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          rm -f \
+            .github/workflows/refine-code-readability.yml \
+            .github/tmp/refine_code.part1 \
+            .github/tmp/refine_code.part2 \
+            .github/tmp/refine_code.part3
+
+          git add -A
+          git reset --soft "$ORIGINAL_HEAD"
+          git commit -m "Simplify metadata correction planning"
+          git push --force-with-lease origin "HEAD:$FEATURE_BRANCH"
+
+      - name: Restore original branch if validation fails
+        if: failure()
+        shell: bash
+        run: |
+          git reset --hard "$ORIGINAL_HEAD"
+          git push --force origin "HEAD:$FEATURE_BRANCH"
+
+      - name: Close trigger PR and delete trigger branch
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh pr close "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" || true
+          git push origin --delete "${{ github.event.pull_request.head.ref }}" || true
