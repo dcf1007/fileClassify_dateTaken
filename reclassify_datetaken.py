@@ -819,10 +819,10 @@ def read_related_files_metadata(metadata_reader, primary_stem, related_files):
     Date-only and time-only values are not combined into candidates; raw records
     remain available so existing writable components can follow the final state.
 
-    Recognized but impossible local timestamps are retained as invalid records,
-    never as candidates. Invalid UTC references and FileModifyDate values become
-    nonfatal warnings. Repair decisions are deliberately deferred until after a
-    valid final capture state and timezone/DST decision exist.
+    Recognized but impossible local, UTC-reference, and filesystem timestamps are
+    retained as invalid records, never as candidates. When a target is writable,
+    repair may be explicitly approved only after a valid final capture state and
+    timezone/DST decision exist; otherwise the original value remains untouched.
 
     ``FileModifyDate`` is read from the start only for exact-primary-stem image
     and video files. Derivative media cannot influence consensus through their
@@ -850,6 +850,7 @@ def read_related_files_metadata(metadata_reader, primary_stem, related_files):
             "records": [],
             "capture_candidates": [],
             "timezone_context": [],
+            "global_context_records": [],
             "associated_offset_records": [],
             "utc_references": [],
             "invalid_capture_records": [],
@@ -912,14 +913,43 @@ def read_related_files_metadata(metadata_reader, primary_stem, related_files):
                 try:
                     parsed_utc = parse_metadata_datetime(raw_value)
                 except ValueError:
-                    file_record["warnings"].append(
-                        f"invalid UTC-reference metadata: {metadata_key}={raw_value!r}"
-                    )
-                    continue
+                    parsed_utc = None
+
                 if parsed_utc is not None and parsed_utc.local_datetime is not None:
                     reference = (metadata_key, parsed_utc.local_datetime)
                     if reference not in file_record["utc_references"]:
                         file_record["utc_references"].append(reference)
+                    continue
+
+                # Valid GPS date-only/time-only components are incomplete UTC
+                # evidence, not errors. They remain untouched and do not become
+                # standalone candidates now that explicit component pairing has
+                # been removed. Every other invalid UTC representation is retained
+                # as a repairable record when its ExifTool target is writable.
+                if parsed_utc is not None and (
+                    (tag_name == "GPSDateStamp" and parsed_utc.local_date is not None)
+                    or (
+                        tag_name == "GPSTimeStamp" and parsed_utc.local_time is not None
+                    )
+                ):
+                    continue
+
+                if tag_name == "GPSDateStamp":
+                    invalid_kind = "utc_date"
+                elif tag_name == "GPSTimeStamp":
+                    invalid_kind = "utc_time"
+                else:
+                    invalid_kind = "utc_datetime"
+                file_record["invalid_capture_records"].append(
+                    {
+                        "metadata_key": metadata_key,
+                        "groups": groups,
+                        "tag_name": tag_name,
+                        "raw_value": raw_value,
+                        "kind": invalid_kind,
+                        "repair_approved": False,
+                    }
+                )
                 continue
 
             # Offset, city, profile, and DST fields describe context; they
@@ -928,6 +958,34 @@ def read_related_files_metadata(metadata_reader, primary_stem, related_files):
                 context_record = (metadata_key, tag_name, raw_value)
                 if context_record not in file_record["timezone_context"]:
                     file_record["timezone_context"].append(context_record)
+
+                # File-global camera configuration retains its provenance. The
+                # broad metadata family and concrete namespace identify one real
+                # configuration bundle; Copy* extraction labels are intentionally
+                # ignored because they are duplicate views, not another camera.
+                if groups:
+                    family_zero = groups[0]
+                    family_one = next(
+                        (
+                            group_name
+                            for group_name in groups[1:]
+                            if not group_name.casefold().startswith("copy")
+                        ),
+                        family_zero,
+                    )
+                    global_context_record = (
+                        (family_zero, family_one),
+                        metadata_key,
+                        tag_name,
+                        raw_value,
+                    )
+                    if (
+                        global_context_record
+                        not in file_record["global_context_records"]
+                    ):
+                        file_record["global_context_records"].append(
+                            global_context_record
+                        )
 
                 # Separate OffsetTime* fields are associated only with a
                 # timestamp in the same ExifTool family/namespace. Copy labels
@@ -1069,9 +1127,20 @@ def read_related_files_metadata(metadata_reader, primary_stem, related_files):
             if modification_value is not None:
                 try:
                     parsed_modify = parse_metadata_datetime(modification_value)
-                except ValueError as error:
-                    file_record["warnings"].append(
-                        "invalid FileModifyDate: " f"{modification_value!r} ({error})"
+                except ValueError:
+                    # FileModifyDate is a filesystem pseudo-tag rather than an
+                    # embedded ExifTool target. Keep the invalid value as a
+                    # structured repair record so the user may explicitly approve
+                    # whole-second system-time alignment after final consensus.
+                    file_record["invalid_capture_records"].append(
+                        {
+                            "metadata_key": "File:System:FileModifyDate",
+                            "groups": ("File", "System"),
+                            "tag_name": "FileModifyDate",
+                            "raw_value": modification_value,
+                            "kind": "file_modify",
+                            "repair_approved": False,
+                        }
                     )
                 else:
                     if (
@@ -1088,6 +1157,21 @@ def read_related_files_metadata(metadata_reader, primary_stem, related_files):
                                 "offset_minutes": None,
                                 "fraction": parsed_modify.fraction,
                                 "kind": "file_modify",
+                            }
+                        )
+                    else:
+                        # A known FileModifyDate tag with an unrecognized value is
+                        # still invalid, even when it does not match one of the
+                        # supported date/time syntaxes closely enough to raise a
+                        # calendar/clock ValueError.
+                        file_record["invalid_capture_records"].append(
+                            {
+                                "metadata_key": "File:System:FileModifyDate",
+                                "groups": ("File", "System"),
+                                "tag_name": "FileModifyDate",
+                                "raw_value": modification_value,
+                                "kind": "file_modify",
+                                "repair_approved": False,
                             }
                         )
 
@@ -1116,18 +1200,16 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
     explicit state but cannot erase a genuine metadata conflict.
 
     Inline offsets belong directly to their timestamp. Separate OffsetTime* fields
-    are paired only inside the same ExifTool family/namespace. Camera-global offset
-    and DST evidence remains global to primary capture media; UTC counterparts
-    derive offset-only evidence from the local/UTC clock difference.
+    are paired only inside the same ExifTool family/namespace. Camera-global state
+    is represented as real provenance-preserving bundles and may supplement naive
+    timestamps anywhere in the same primary file. Partial bundles borrow a missing
+    value only when file-wide evidence is unique; explicit alternatives remain
+    separate. UTC counterparts derive offset-only evidence from the clock difference.
     """
     primary_capture_media = set(related_files_metadata["primary_capture_media"])
     candidate_variants = []
 
     for source_file, file_record in related_files_metadata["files"].items():
-        values_by_tag = {}
-        for source_name, tag_name, raw_value in file_record["timezone_context"]:
-            values_by_tag.setdefault(tag_name, []).append((source_name, raw_value))
-
         associated_offsets_by_scope_and_tag = {}
         for (
             association_scope,
@@ -1140,14 +1222,45 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
                 [],
             ).append((source_name, raw_value))
 
-        global_offset_records = []
-        dst_records = []
+        # --------------------------------------------------------------------
+        # BUILD REAL FILE-GLOBAL CAMERA-STATE BUNDLES
+        #
+        # A maker-note timezone and DST switch describe the camera clock for the
+        # physical file, even when DateTimeOriginal itself lives in EXIF. Values
+        # from one metadata family are therefore kept together. Partial bundles
+        # may borrow a missing dimension from another family only when that value
+        # is unique across the file; explicit alternatives are never cross-multiplied.
+        # --------------------------------------------------------------------
+        global_bundles = []
         if source_file in primary_capture_media:
-            for tag_name in GLOBAL_OFFSET_TAGS:
-                for source_name, raw_value in values_by_tag.get(tag_name, []):
-                    offset_minutes = parse_metadata_offset_minutes(tag_name, raw_value)
-                    if offset_minutes is not None:
-                        global_offset_records.append(
+            records_by_scope = {}
+            for (
+                provenance_scope,
+                source_name,
+                tag_name,
+                raw_value,
+            ) in file_record.get("global_context_records", []):
+                records_by_scope.setdefault(provenance_scope, []).append(
+                    (source_name, tag_name, raw_value)
+                )
+
+            for provenance_scope, scoped_records in records_by_scope.items():
+                values_by_tag = {}
+                for source_name, tag_name, raw_value in scoped_records:
+                    values_by_tag.setdefault(tag_name, []).append(
+                        (source_name, raw_value)
+                    )
+
+                offsets_by_value = {}
+                for tag_name in GLOBAL_OFFSET_TAGS:
+                    for source_name, raw_value in values_by_tag.get(tag_name, []):
+                        offset_minutes = parse_metadata_offset_minutes(
+                            tag_name,
+                            raw_value,
+                        )
+                        if offset_minutes is None:
+                            continue
+                        offsets_by_value.setdefault(offset_minutes, []).append(
                             (
                                 source_file,
                                 source_name,
@@ -1157,36 +1270,189 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
                             )
                         )
 
-            for source_name, raw_value in values_by_tag.get("DaylightSavings", []):
-                state = parse_daylight_saving_value(raw_value)
-                if state is not None:
-                    dst_records.append((source_file, source_name, state))
+                active_profiles = resolve_active_timezone_profiles(values_by_tag)
+                active_dst_tags = set(DIRECT_DST_TAGS)
+                active_dst_tags.update(
+                    active_dst_tag for _, _, active_dst_tag, _ in active_profiles
+                )
+                dst_by_state = {}
+                for tag_name in active_dst_tags:
+                    for source_name, raw_value in values_by_tag.get(tag_name, []):
+                        dst_state = parse_daylight_saving_value(raw_value)
+                        if dst_state is None:
+                            continue
+                        dst_by_state.setdefault(dst_state, []).append(
+                            (source_file, source_name, dst_state)
+                        )
 
-            for _, _, active_dst_tag, _ in resolve_active_timezone_profiles(
-                values_by_tag
-            ):
-                for source_name, raw_value in values_by_tag.get(active_dst_tag, []):
-                    state = parse_daylight_saving_value(raw_value)
-                    if state is not None:
-                        dst_records.append((source_file, source_name, state))
+                descriptive_context = []
+                for source_name, raw_value in values_by_tag.get(
+                    "TimeZoneCity",
+                    [],
+                ):
+                    descriptive_context.append(
+                        (source_file, f"{source_name}={raw_value}")
+                    )
+                for (
+                    selector_tag,
+                    active_profile,
+                    _,
+                    context_tags,
+                ) in active_profiles:
+                    for context_tag in context_tags:
+                        for source_name, raw_value in values_by_tag.get(
+                            context_tag,
+                            [],
+                        ):
+                            descriptive_context.append(
+                                (
+                                    source_file,
+                                    f"{source_name}={raw_value} ({active_profile})",
+                                )
+                            )
+                    for source_name, raw_value in values_by_tag.get(
+                        selector_tag,
+                        [],
+                    ):
+                        descriptive_context.append(
+                            (
+                                source_file,
+                                f"{source_name}={raw_value} -> {active_profile}",
+                            )
+                        )
+                descriptive_context = list(dict.fromkeys(descriptive_context))
 
-        global_offset_records = list(dict.fromkeys(global_offset_records))
-        dst_records = list(dict.fromkeys(dst_records))
+                offset_values = sorted(offsets_by_value)
+                dst_values = sorted(dst_by_state)
+                if len(offset_values) <= 1 or len(dst_values) <= 1:
+                    # One unique value in either dimension can safely accompany
+                    # every explicit alternative in the other dimension.
+                    for offset_minutes in offset_values or [None]:
+                        for dst_state in dst_values or [None]:
+                            if offset_minutes is None and dst_state is None:
+                                continue
+                            global_bundles.append(
+                                {
+                                    "offset_minutes": offset_minutes,
+                                    "dst_state": dst_state,
+                                    "offset_records": list(
+                                        offsets_by_value.get(offset_minutes, [])
+                                    ),
+                                    "dst_records": list(
+                                        dst_by_state.get(dst_state, [])
+                                    ),
+                                    "context_records": list(descriptive_context),
+                                    "provenance": ("global", provenance_scope),
+                                }
+                            )
+                else:
+                    # Several offsets and several DST values in one family have
+                    # no reliable pairing information. Preserve them as partial
+                    # alternatives instead of inventing every combination.
+                    for offset_minutes in offset_values:
+                        global_bundles.append(
+                            {
+                                "offset_minutes": offset_minutes,
+                                "dst_state": None,
+                                "offset_records": list(
+                                    offsets_by_value[offset_minutes]
+                                ),
+                                "dst_records": [],
+                                "context_records": list(descriptive_context),
+                                "provenance": ("global", provenance_scope),
+                            }
+                        )
+                    for dst_state in dst_values:
+                        global_bundles.append(
+                            {
+                                "offset_minutes": None,
+                                "dst_state": dst_state,
+                                "offset_records": [],
+                                "dst_records": list(dst_by_state[dst_state]),
+                                "context_records": list(descriptive_context),
+                                "provenance": ("global", provenance_scope),
+                            }
+                        )
+
+            # A missing dimension may be supplied file-wide only when all global
+            # evidence agrees on one value. This supports cameras that split
+            # timezone and DST across families without hiding real conflicts.
+            unique_global_offsets = {
+                bundle["offset_minutes"]
+                for bundle in global_bundles
+                if bundle["offset_minutes"] is not None
+            }
+            unique_global_dst_states = {
+                bundle["dst_state"]
+                for bundle in global_bundles
+                if bundle["dst_state"] is not None
+            }
+            all_offset_records = [
+                record
+                for bundle in global_bundles
+                for record in bundle["offset_records"]
+            ]
+            all_dst_records = [
+                record for bundle in global_bundles for record in bundle["dst_records"]
+            ]
+            for bundle in global_bundles:
+                if bundle["offset_minutes"] is None and len(unique_global_offsets) == 1:
+                    bundle["offset_minutes"] = next(iter(unique_global_offsets))
+                    bundle["offset_records"] = list(dict.fromkeys(all_offset_records))
+                if bundle["dst_state"] is None and len(unique_global_dst_states) == 1:
+                    bundle["dst_state"] = next(iter(unique_global_dst_states))
+                    bundle["dst_records"] = list(dict.fromkeys(all_dst_records))
+
+            merged_global_bundles = {}
+            for bundle in global_bundles:
+                state_key = (bundle["offset_minutes"], bundle["dst_state"])
+                merged = merged_global_bundles.setdefault(
+                    state_key,
+                    {
+                        "offset_minutes": bundle["offset_minutes"],
+                        "dst_state": bundle["dst_state"],
+                        "offset_records": [],
+                        "dst_records": [],
+                        "context_records": [],
+                        "provenance": [],
+                    },
+                )
+                for collection_name in (
+                    "offset_records",
+                    "dst_records",
+                    "context_records",
+                ):
+                    for record in bundle[collection_name]:
+                        if record not in merged[collection_name]:
+                            merged[collection_name].append(record)
+                if bundle["provenance"] not in merged["provenance"]:
+                    merged["provenance"].append(bundle["provenance"])
+            global_bundles = list(merged_global_bundles.values())
 
         for candidate in file_record["capture_candidates"]:
-            candidate_offset_records = []
+            candidate_specific_bundles = []
+
             if (
                 candidate["kind"] != "file_modify"
                 and candidate["offset_minutes"] is not None
             ):
-                candidate_offset_records.append(
-                    (
-                        source_file,
-                        candidate["source"],
-                        "UTC" + format_offset(candidate["offset_minutes"]),
-                        candidate["offset_minutes"],
-                        "timestamp offset",
-                    )
+                candidate_specific_bundles.append(
+                    {
+                        "offset_minutes": candidate["offset_minutes"],
+                        "dst_state": None,
+                        "offset_records": [
+                            (
+                                source_file,
+                                candidate["source"],
+                                "UTC" + format_offset(candidate["offset_minutes"]),
+                                candidate["offset_minutes"],
+                                "timestamp offset",
+                            )
+                        ],
+                        "dst_records": [],
+                        "context_records": [],
+                        "provenance": ("timestamp", candidate["source"]),
+                    }
                 )
 
             associated_offset_tag = ASSOCIATED_OFFSET_TAGS.get(candidate["tag_name"])
@@ -1199,44 +1465,187 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
                         associated_offset_tag,
                         raw_value,
                     )
-                    if offset_minutes is not None:
-                        candidate_offset_records.append(
-                            (
-                                source_file,
-                                source_name,
-                                str(raw_value).strip(),
-                                offset_minutes,
-                                "associated timestamp offset",
-                            )
-                        )
+                    if offset_minutes is None:
+                        continue
+                    candidate_specific_bundles.append(
+                        {
+                            "offset_minutes": offset_minutes,
+                            "dst_state": None,
+                            "offset_records": [
+                                (
+                                    source_file,
+                                    source_name,
+                                    str(raw_value).strip(),
+                                    offset_minutes,
+                                    "associated timestamp offset",
+                                )
+                            ],
+                            "dst_records": [],
+                            "context_records": [],
+                            "provenance": (
+                                "associated",
+                                candidate["association_scope"],
+                            ),
+                        }
+                    )
 
             if source_file in primary_capture_media:
-                candidate_offset_records.extend(global_offset_records)
                 for source_name, utc_datetime in file_record["utc_references"]:
-                    # UTC counterparts may be sampled several seconds away from
-                    # the local capture clock. Offsets are minute-based, so drop
-                    # the leftover seconds rather than rounding them into the next
-                    # minute. ``int`` truncates toward zero for both positive and
-                    # negative differences.
                     derived_offset = int(
                         (candidate["datetime"] - utc_datetime).total_seconds() / 60
                     )
                     if -12 * 60 <= derived_offset <= 14 * 60:
-                        candidate_offset_records.append(
-                            (
-                                source_file,
-                                source_name,
-                                utc_datetime.strftime("%Y-%m-%d %H:%M:%S UTC"),
-                                derived_offset,
-                                "UTC counterpart",
-                            )
+                        candidate_specific_bundles.append(
+                            {
+                                "offset_minutes": derived_offset,
+                                "dst_state": None,
+                                "offset_records": [
+                                    (
+                                        source_file,
+                                        source_name,
+                                        utc_datetime.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                                        derived_offset,
+                                        "UTC counterpart",
+                                    )
+                                ],
+                                "dst_records": [],
+                                "context_records": [],
+                                "provenance": ("utc", source_name),
+                            }
                         )
 
-            candidate_offset_records = list(dict.fromkeys(candidate_offset_records))
+            # Equivalent timestamp-specific offset evidence is one state with
+            # several supporting records, not several duplicate variants.
+            merged_specific_bundles = {}
+            for bundle in candidate_specific_bundles:
+                state_key = (bundle["offset_minutes"], bundle["dst_state"])
+                merged = merged_specific_bundles.setdefault(
+                    state_key,
+                    {
+                        "offset_minutes": bundle["offset_minutes"],
+                        "dst_state": bundle["dst_state"],
+                        "offset_records": [],
+                        "dst_records": [],
+                        "context_records": [],
+                        "provenance": [],
+                    },
+                )
+                for record in bundle["offset_records"]:
+                    if record not in merged["offset_records"]:
+                        merged["offset_records"].append(record)
+                if bundle["provenance"] not in merged["provenance"]:
+                    merged["provenance"].append(bundle["provenance"])
+            candidate_specific_bundles = list(merged_specific_bundles.values())
 
-            # Decimal seconds retain every fractional digit supplied by metadata.
-            # Compute the exact value once per source candidate before expanding
-            # compatible offset/DST variants.
+            candidate_state_bundles = []
+            if candidate_specific_bundles and global_bundles:
+                for specific_bundle in candidate_specific_bundles:
+                    compatible_globals = [
+                        global_bundle
+                        for global_bundle in global_bundles
+                        if (
+                            specific_bundle["offset_minutes"] is None
+                            or global_bundle["offset_minutes"] is None
+                            or specific_bundle["offset_minutes"]
+                            == global_bundle["offset_minutes"]
+                        )
+                        and (
+                            specific_bundle["dst_state"] is None
+                            or global_bundle["dst_state"] is None
+                            or specific_bundle["dst_state"]
+                            == global_bundle["dst_state"]
+                        )
+                    ]
+                    if compatible_globals:
+                        for global_bundle in compatible_globals:
+                            candidate_state_bundles.append(
+                                {
+                                    "offset_minutes": (
+                                        specific_bundle["offset_minutes"]
+                                        if specific_bundle["offset_minutes"] is not None
+                                        else global_bundle["offset_minutes"]
+                                    ),
+                                    "dst_state": (
+                                        specific_bundle["dst_state"]
+                                        if specific_bundle["dst_state"] is not None
+                                        else global_bundle["dst_state"]
+                                    ),
+                                    "offset_records": list(
+                                        dict.fromkeys(
+                                            specific_bundle["offset_records"]
+                                            + global_bundle["offset_records"]
+                                        )
+                                    ),
+                                    "dst_records": list(
+                                        dict.fromkeys(
+                                            specific_bundle["dst_records"]
+                                            + global_bundle["dst_records"]
+                                        )
+                                    ),
+                                    "context_records": list(
+                                        global_bundle["context_records"]
+                                    ),
+                                }
+                            )
+                    else:
+                        candidate_state_bundles.append(specific_bundle)
+
+                # An incompatible global configuration is real conflicting
+                # evidence for the same physical file and remains selectable.
+                for global_bundle in global_bundles:
+                    if not any(
+                        (
+                            specific_bundle["offset_minutes"] is None
+                            or global_bundle["offset_minutes"] is None
+                            or specific_bundle["offset_minutes"]
+                            == global_bundle["offset_minutes"]
+                        )
+                        and (
+                            specific_bundle["dst_state"] is None
+                            or global_bundle["dst_state"] is None
+                            or specific_bundle["dst_state"]
+                            == global_bundle["dst_state"]
+                        )
+                        for specific_bundle in candidate_specific_bundles
+                    ):
+                        candidate_state_bundles.append(global_bundle)
+            elif candidate_specific_bundles:
+                candidate_state_bundles = candidate_specific_bundles
+            elif global_bundles:
+                candidate_state_bundles = global_bundles
+            else:
+                candidate_state_bundles = [
+                    {
+                        "offset_minutes": None,
+                        "dst_state": None,
+                        "offset_records": [],
+                        "dst_records": [],
+                        "context_records": [],
+                    }
+                ]
+
+            merged_candidate_states = {}
+            for bundle in candidate_state_bundles:
+                state_key = (bundle["offset_minutes"], bundle["dst_state"])
+                merged = merged_candidate_states.setdefault(
+                    state_key,
+                    {
+                        "offset_minutes": bundle["offset_minutes"],
+                        "dst_state": bundle["dst_state"],
+                        "offset_records": [],
+                        "dst_records": [],
+                        "context_records": [],
+                    },
+                )
+                for collection_name in (
+                    "offset_records",
+                    "dst_records",
+                    "context_records",
+                ):
+                    for record in bundle.get(collection_name, []):
+                        if record not in merged[collection_name]:
+                            merged[collection_name].append(record)
+
             whole_datetime = candidate["datetime"].replace(microsecond=0)
             epoch = datetime(1970, 1, 1)
             elapsed = whole_datetime - epoch
@@ -1248,32 +1657,19 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
             if exact_fraction:
                 candidate_time_value += Decimal(f"0.{exact_fraction}")
 
-            offset_choices = sorted(
-                {record[3] for record in candidate_offset_records}
-            ) or [None]
-            dst_choices = sorted({record[2] for record in dst_records}) or [None]
-
-            for offset_minutes in offset_choices:
-                for dst_state in dst_choices:
-                    candidate_variants.append(
-                        {
-                            **candidate,
-                            "source_file": source_file,
-                            "time_value": candidate_time_value,
-                            "state_offset_minutes": offset_minutes,
-                            "state_dst": dst_state,
-                            "offset_records": [
-                                record
-                                for record in candidate_offset_records
-                                if record[3] == offset_minutes
-                            ],
-                            "dst_records": [
-                                record
-                                for record in dst_records
-                                if record[2] == dst_state
-                            ],
-                        }
-                    )
+            for bundle in merged_candidate_states.values():
+                candidate_variants.append(
+                    {
+                        **candidate,
+                        "source_file": source_file,
+                        "time_value": candidate_time_value,
+                        "state_offset_minutes": bundle["offset_minutes"],
+                        "state_dst": bundle["dst_state"],
+                        "offset_records": bundle["offset_records"],
+                        "dst_records": bundle["dst_records"],
+                        "context_records": bundle["context_records"],
+                    }
+                )
 
     sorted_variants = sorted(
         candidate_variants,
@@ -1309,114 +1705,137 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
     consensus_options = []
     kind_priority = {"complete": 0, "composite": 1, "file_modify": 2}
     for temporal_cluster in temporal_clusters:
-        offset_choices = sorted(
-            {
-                variant["state_offset_minutes"]
-                for variant in temporal_cluster
-                if variant["state_offset_minutes"] is not None
-            }
-        ) or [None]
-        dst_choices = sorted(
-            {
-                variant["state_dst"]
-                for variant in temporal_cluster
-                if variant["state_dst"] is not None
-            }
-        ) or [None]
+        actual_state_choices = []
+        for variant in temporal_cluster:
+            state_choice = (
+                variant["state_offset_minutes"],
+                variant["state_dst"],
+            )
+            if state_choice not in actual_state_choices:
+                actual_state_choices.append(state_choice)
 
-        for offset_minutes in offset_choices:
-            for dst_state in dst_choices:
-                compatible_variants = [
-                    variant
-                    for variant in temporal_cluster
-                    if (
-                        variant["state_offset_minutes"] is None
-                        or variant["state_offset_minutes"] == offset_minutes
-                    )
-                    and (
-                        variant["state_dst"] is None
-                        or variant["state_dst"] == dst_state
-                    )
-                ]
-                if not compatible_variants:
-                    continue
+        explicit_state_choices = [
+            state_choice
+            for state_choice in actual_state_choices
+            if state_choice != (None, None)
+        ]
+        state_choices = explicit_state_choices or [(None, None)]
 
-                records_by_exact_time = {}
-                for variant in compatible_variants:
-                    records_by_exact_time.setdefault(
-                        variant["time_value"],
-                        [],
-                    ).append(variant)
-
-                representative_time = min(
-                    records_by_exact_time,
-                    key=lambda candidate_time: (
-                        -len(
-                            {
-                                variant["source_file"]
-                                for variant in records_by_exact_time[candidate_time]
-                            }
-                        ),
-                        -len(
-                            {
-                                variant["source_file"]
-                                for variant in records_by_exact_time[candidate_time]
-                                if variant["kind"] != "file_modify"
-                            }
-                        ),
-                        -len(
-                            {
-                                variant["source_file"]
-                                for variant in records_by_exact_time[candidate_time]
-                                if variant["kind"] == "complete"
-                            }
-                        ),
-                        candidate_time,
-                    ),
+        # A partial state is supporting evidence for a more complete actual
+        # state when their known dimensions agree. It must not become a separate
+        # option, but two unrelated partial states are never combined into a new
+        # complete state merely because they are mutually compatible.
+        reduced_state_choices = []
+        for state_choice in state_choices:
+            known_dimensions = sum(value is not None for value in state_choice)
+            if any(
+                other_choice != state_choice
+                and sum(value is not None for value in other_choice) > known_dimensions
+                and all(
+                    value is None or other_value is None or value == other_value
+                    for value, other_value in zip(state_choice, other_choice)
                 )
-                representative_variant = min(
-                    records_by_exact_time[representative_time],
-                    key=lambda variant: (
-                        kind_priority[variant["kind"]],
-                        variant["source_file"].name.casefold(),
-                        str(variant["source"]).casefold(),
-                        variant.get("fraction") or "",
-                    ),
-                )
-                representative_datetime = representative_variant["datetime"]
+                for other_choice in state_choices
+            ):
+                continue
+            reduced_state_choices.append(state_choice)
 
-                option = {
-                    "datetime": representative_datetime,
-                    "fraction": representative_variant.get("fraction"),
-                    "date_type": max(
-                        variant["date_type"] for variant in compatible_variants
+        for offset_minutes, dst_state in reduced_state_choices:
+            compatible_variants = [
+                variant
+                for variant in temporal_cluster
+                if (
+                    variant["state_offset_minutes"] is None
+                    or offset_minutes is None
+                    or variant["state_offset_minutes"] == offset_minutes
+                )
+                and (
+                    variant["state_dst"] is None
+                    or dst_state is None
+                    or variant["state_dst"] == dst_state
+                )
+            ]
+            if not compatible_variants:
+                continue
+
+            records_by_exact_time = {}
+            for variant in compatible_variants:
+                records_by_exact_time.setdefault(
+                    variant["time_value"],
+                    [],
+                ).append(variant)
+
+            representative_time = min(
+                records_by_exact_time,
+                key=lambda candidate_time: (
+                    -len(
+                        {
+                            variant["source_file"]
+                            for variant in records_by_exact_time[candidate_time]
+                        }
                     ),
-                    "offset_minutes": offset_minutes,
-                    "dst_state": dst_state,
-                    "sources": [],
-                    "offset_records": [],
-                    "dst_records": [],
-                    "earliest_time_value": min(
-                        variant["time_value"] for variant in compatible_variants
+                    -len(
+                        {
+                            variant["source_file"]
+                            for variant in records_by_exact_time[candidate_time]
+                            if variant["kind"] != "file_modify"
+                        }
                     ),
-                    "latest_time_value": max(
-                        variant["time_value"] for variant in compatible_variants
+                    -len(
+                        {
+                            variant["source_file"]
+                            for variant in records_by_exact_time[candidate_time]
+                            if variant["kind"] == "complete"
+                        }
                     ),
-                }
-                for variant in compatible_variants:
-                    source_record = (
-                        variant["source_file"],
-                        variant["source"],
-                    )
-                    if source_record not in option["sources"]:
-                        option["sources"].append(source_record)
-                    for record in variant["offset_records"]:
-                        if record not in option["offset_records"]:
-                            option["offset_records"].append(record)
-                    for record in variant["dst_records"]:
-                        if record not in option["dst_records"]:
-                            option["dst_records"].append(record)
-                consensus_options.append(option)
+                    candidate_time,
+                ),
+            )
+            representative_variant = min(
+                records_by_exact_time[representative_time],
+                key=lambda variant: (
+                    kind_priority[variant["kind"]],
+                    variant["source_file"].name.casefold(),
+                    str(variant["source"]).casefold(),
+                    variant.get("fraction") or "",
+                ),
+            )
+
+            option = {
+                "datetime": representative_variant["datetime"],
+                "fraction": representative_variant.get("fraction"),
+                "date_type": max(
+                    variant["date_type"] for variant in compatible_variants
+                ),
+                "offset_minutes": offset_minutes,
+                "dst_state": dst_state,
+                "sources": [],
+                "offset_records": [],
+                "dst_records": [],
+                "context_records": [],
+                "earliest_time_value": min(
+                    variant["time_value"] for variant in compatible_variants
+                ),
+                "latest_time_value": max(
+                    variant["time_value"] for variant in compatible_variants
+                ),
+            }
+            for variant in compatible_variants:
+                source_record = (
+                    variant["source_file"],
+                    variant["source"],
+                )
+                if source_record not in option["sources"]:
+                    option["sources"].append(source_record)
+                for collection_name in (
+                    "offset_records",
+                    "dst_records",
+                    "context_records",
+                ):
+                    for record in variant.get(collection_name, []):
+                        if record not in option[collection_name]:
+                            option[collection_name].append(record)
+            consensus_options.append(option)
 
     if not consensus_options:
         for source_file in related_files_metadata["usable_files"]:
@@ -1430,6 +1849,7 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
             "date_type": None,
             "offset_records": [],
             "dst_records": [],
+            "context_records": [],
             "preserve_timezone_metadata": False,
             "preferred_utc_offset_minutes": None,
         }
@@ -1512,6 +1932,7 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
         "date_type": selected_option["date_type"],
         "offset_records": selected_option["offset_records"],
         "dst_records": selected_option["dst_records"],
+        "context_records": selected_option["context_records"],
         "preserve_timezone_metadata": False,
         "preferred_utc_offset_minutes": selected_option["offset_minutes"],
     }
@@ -1524,7 +1945,6 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
 
 def review_and_correct_timezone_and_dst(
     capture_time_consensus,
-    related_files_metadata,
     timezone_name,
     classification_timezone,
     automatic_correction_rules,
@@ -1553,46 +1973,11 @@ def review_and_correct_timezone_and_dst(
 
     dst_records = list(capture_time_consensus.get("dst_records", []))
     offset_records = list(capture_time_consensus.get("offset_records", []))
-    display_records = []
+    display_records = list(capture_time_consensus.get("context_records", []))
 
-    # Offset and DST conflicts were resolved with the capture-time choice. This
-    # phase therefore consumes only the selected option's complete evidence
-    # environment. Primary-media context is reread here only for explanatory
-    # city/profile labels, not to reintroduce rejected state alternatives.
-    for source_file in related_files_metadata["primary_capture_media"]:
-        file_record = related_files_metadata["files"].get(source_file)
-        if file_record is None:
-            continue
-
-        values_by_tag = {}
-        for source_name, tag_name, raw_value in file_record["timezone_context"]:
-            values_by_tag.setdefault(tag_name, []).append((source_name, raw_value))
-
-        for (
-            selector_tag,
-            active_profile,
-            _,
-            context_tags,
-        ) in resolve_active_timezone_profiles(values_by_tag):
-            for context_tag in context_tags:
-                for source_name, raw_value in values_by_tag.get(context_tag, []):
-                    display_records.append(
-                        (
-                            source_file,
-                            f"{source_name}={raw_value} ({active_profile})",
-                        )
-                    )
-            for source_name, raw_value in values_by_tag.get(selector_tag, []):
-                display_records.append(
-                    (
-                        source_file,
-                        f"{source_name}={raw_value} -> {active_profile}",
-                    )
-                )
-
-        for tag_name in ("TimeZoneCity", "TimeZone"):
-            for source_name, raw_value in values_by_tag.get(tag_name, []):
-                display_records.append((source_file, f"{source_name}={raw_value}"))
+    # Consensus already selected one provenance-preserving evidence bundle.
+    # Review consumes that immutable state directly and never reopens raw file
+    # metadata, so rejected alternatives cannot leak back into the prompt.
 
     # Collapse repeated telemetry without losing distinct filenames or source
     # tags. The full tuples are deduplicated, so identical values from different
@@ -1900,29 +2285,6 @@ def review_and_correct_timezone_and_dst(
 # harmless separator/numeric normalization is not reported as failure.
 
 
-def add_correction_operation(operations, skipped, operation):
-    """
-    Add one absolute write and reject contradictory duplicate targets.
-
-    Duplicate extraction paths may map to one writable target. Identical writes
-    collapse; contradictory desired values skip the target rather than choosing
-    arbitrarily.
-    """
-    target_key = operation["target"].removesuffix("#")
-    existing = operations.get(target_key)
-    if existing is None:
-        operations[target_key] = operation
-        return
-    if (
-        existing["value"] == operation["value"]
-        and existing["kind"] == operation["kind"]
-        and existing["expected"] == operation["expected"]
-    ):
-        return
-    operations.pop(target_key, None)
-    skipped.add(f"{target_key} (conflicting duplicate values)")
-
-
 def format_metadata_offset_value(tag_name, original_value, offset_minutes):
     """
     Preserve a standalone offset field's representation where practical.
@@ -1959,482 +2321,522 @@ def update_copied_file_metadata_and_system_times(
     classification_timezone,
 ):
     """
-    Normalize eligible metadata and FileModifyDate in one newly created copy.
+    Normalize one newly created classified copy from one final capture state.
 
-    The final consensus is authoritative. Existing writable complete capture
-    timestamps and existing writable date-only/time-only components are aligned
-    to it. This is an absolute normalization, not a delta applied to an unrelated
-    original value. Composite, System, File, UTC-reference,
-    editing/history/runtime, and other excluded fields are never direct targets.
-    Missing fields are not made.
+    Every writable ExifTool target is grouped before any command is formatted.
+    Duplicate extraction views therefore become one semantic target with one role
+    and one final value. A target that appears to have incompatible semantic roles
+    indicates an internal mapping error; correction of the new copy aborts instead
+    of guessing, silently skipping, or asking the user to resolve implementation
+    details after the authoritative capture state has already been selected.
 
-    Timestamp-associated offsets may be updated in media or sidecars. Camera-
-    global offsets and active DST/profile values are updated only in primary or
-    derivative image/video files; inactive profiles remain untouched. If the user
-    explicitly keeps contradictory timezone/DST evidence, all existing timezone
-    representations are preserved while local capture fields may still follow the
-    selected consensus. Ambiguous wall clocks are never assigned a guessed offset.
+    Existing local capture fields follow the final wall clock. Existing UTC fields
+    are changed only when an invalid value was explicitly approved for repair, and
+    then receive the corresponding UTC instant. Associated and camera-global
+    offsets/DST settings are normalized only when timezone review did not preserve
+    them. Missing fields are never created. Composite, File, System, inactive
+    profile, editing/history/runtime, and other read-only/excluded fields are not
+    direct ExifTool targets.
 
-    Writes are batched, retried individually if one read-only maker field blocks
-    the batch, and verified by rereading the copy. FileModifyDate is aligned only
-    for copied image/video files.
+    One combined ExifTool write is attempted first, with individual retries when a
+    read-only maker field blocks the batch. Every operation is reread and verified
+    semantically. FileModifyDate is handled independently through ``os.utime``.
     """
     selected_datetime = capture_time_consensus["datetime"]
     if selected_datetime is None:
         return [], []
     selected_fraction = capture_time_consensus.get("fraction")
-
-    operations = {}
-    skipped = set()
-    updated = []
-    records = file_record["records"]
     preserve_timezone_metadata = capture_time_consensus.get(
         "preserve_timezone_metadata",
         False,
     )
 
-    # This offset still determines the absolute FileModifyDate written to copied
-    # media. It is used to normalize embedded timezone metadata only when review
-    # did not explicitly preserve contradictory evidence.
-    valid_filesystem_offsets = {
-        state[1]
-        for state in timezone_states_for_local_time(
-            selected_datetime,
-            classification_timezone,
-        )
-    }
+    updated = []
+    skipped = set()
+    records = file_record["records"]
+
+    valid_final_states = timezone_states_for_local_time(
+        selected_datetime,
+        classification_timezone,
+    )
+    valid_final_offsets = {state[1] for state in valid_final_states}
     preferred_offset = capture_time_consensus.get("preferred_utc_offset_minutes")
-    if preferred_offset in valid_filesystem_offsets:
+    if preferred_offset in valid_final_offsets:
         expected_offset = preferred_offset
-    elif len(valid_filesystem_offsets) == 1:
-        expected_offset = next(iter(valid_filesystem_offsets))
+    elif len(valid_final_offsets) == 1:
+        expected_offset = next(iter(valid_final_offsets))
     else:
         expected_offset = None
+    expected_state = valid_final_states[0] if len(valid_final_states) == 1 else None
 
-    # Context fields are indexed by tag because their semantics are independent
-    # of one storage family; complete capture fields are still handled from their
-    # original records so each explicit write target remains available.
     values_by_tag = {}
     for metadata_key, groups, tag_name, raw_value in records:
         values_by_tag.setdefault(tag_name, []).append((metadata_key, groups, raw_value))
 
-    # ------------------------------------------------------------------------
-    # REPAIR USER-APPROVED INVALID CAPTURE FIELDS
-    #
-    # Invalid syntax is never rewritten automatically. After explicit approval,
-    # the existing field representation is replaced with the selected capture
-    # value; no missing field is created. Read-only targets remain warnings only.
-    # ------------------------------------------------------------------------
-    approved_invalid_targets = set()
-    for invalid_record in file_record.get("invalid_capture_records", []):
-        if not invalid_record.get("repair_approved"):
-            continue
-        if preserve_timezone_metadata:
-            # Keep is authoritative: invalid metadata remains untouched,
-            # including any inline offset text.
-            continue
-        write_target = get_metadata_write_target(
-            invalid_record["groups"],
-            invalid_record["tag_name"],
-        )
-        if write_target is None:
-            continue
+    active_dst_tags = set(DIRECT_DST_TAGS)
+    active_dst_tags.update(
+        active_dst_tag
+        for _, _, active_dst_tag, _ in resolve_active_timezone_profiles(values_by_tag)
+    )
 
-        raw_value = invalid_record["raw_value"]
-        try:
-            if invalid_record["kind"] == "datetime":
-                match = COMPLETE_DATE_TIME_PATTERN.fullmatch(str(raw_value).strip())
-                has_inline_offset = (
-                    match is not None and match.group("timezone") is not None
-                )
-                target_offset = expected_offset if has_inline_offset else None
-                if has_inline_offset and target_offset is None:
-                    skipped.add(
-                        f"{invalid_record['metadata_key']} "
-                        "(ambiguous consensus UTC offset)"
-                    )
-                    continue
-                expected_text = format_complete_datetime(
-                    raw_value,
-                    selected_datetime,
-                    target_offset,
-                    selected_fraction,
-                )
-                expected_parsed = parse_metadata_datetime(expected_text)
-                expected = (
-                    expected_parsed.local_datetime,
-                    expected_parsed.utc_offset_minutes,
-                )
-            elif invalid_record["kind"] == "date":
-                expected_text = format_date_only(raw_value, selected_datetime)
-                expected = selected_datetime.date()
-            else:
-                match = TIME_ONLY_PATTERN.fullmatch(str(raw_value).strip())
-                has_inline_offset = (
-                    match is not None and match.group("timezone") is not None
-                )
-                target_offset = expected_offset if has_inline_offset else None
-                if has_inline_offset and target_offset is None:
-                    skipped.add(
-                        f"{invalid_record['metadata_key']} "
-                        "(ambiguous consensus UTC offset)"
-                    )
-                    continue
-                expected_text = format_time_only(
-                    raw_value,
-                    selected_datetime,
-                    target_offset,
-                    selected_fraction,
-                )
-                expected_parsed = parse_metadata_datetime(expected_text)
-                expected = (
-                    expected_parsed.local_time,
-                    expected_parsed.utc_offset_minutes,
-                )
-        except (TypeError, ValueError):
-            skipped.add(
-                f"{invalid_record['metadata_key']} "
-                "(could not format approved invalid timestamp)"
-            )
-            continue
-
-        approved_invalid_targets.add(write_target.removesuffix("#"))
-        add_correction_operation(
-            operations,
-            skipped,
-            {
-                "target": write_target,
-                "value": expected_text,
-                "kind": invalid_record["kind"],
-                "expected": expected,
-                "tag_name": invalid_record["tag_name"],
-            },
-        )
+    invalid_by_metadata_key = {
+        invalid_record["metadata_key"]: invalid_record
+        for invalid_record in file_record.get("invalid_capture_records", [])
+    }
 
     # ------------------------------------------------------------------------
-    # ALIGN EVERY WRITABLE ELIGIBLE COMPLETE CAPTURE TIMESTAMP TO CONSENSUS
-    #
-    # Rejected values and other eligible local capture fields all receive the
-    # final selected wall clock. An inline offset is replaced only if that field
-    # already had one; naive values remain naive. A separate OffsetTime* value is
-    # handled in the later offset section, so timestamp and attached offset reach
-    # the same final state without inventing either representation.
+    # GROUP PHYSICAL WRITABLE TARGETS BEFORE DERIVING ANY WRITE COMMAND
     # ------------------------------------------------------------------------
+    target_groups = {}
     for metadata_key, groups, tag_name, raw_value in records:
-        if (
-            tag_name in TIME_CONTEXT_TAGS
-            or tag_name in UTC_REFERENCE_TAGS
-            or tag_name in EXCLUDED_CAPTURE_TIME_TAGS
-            or "System" in groups
-        ):
+        target = get_metadata_write_target(groups, tag_name)
+        if target is None:
             continue
-
-        write_target = get_metadata_write_target(groups, tag_name)
-        if write_target is None:
-            # Composite and other calculated/read-only values remain evidence
-            # only; their writable components are handled separately below.
-            continue
-
-        try:
-            parsed = parse_metadata_datetime(raw_value)
-        except ValueError:
-            if write_target not in approved_invalid_targets:
-                skipped.add(f"{metadata_key} (invalid capture timestamp)")
-            continue
-        if parsed is None or parsed.local_datetime is None:
-            continue
-
-        inline_offset = parsed.utc_offset_minutes
-        target_offset = (
-            (inline_offset if preserve_timezone_metadata else expected_offset)
-            if inline_offset is not None
-            else None
-        )
-        if inline_offset is not None and target_offset is None:
-            skipped.add(f"{metadata_key} (ambiguous consensus UTC offset)")
-            continue
-
-        expected_text = format_complete_datetime(
-            raw_value,
-            selected_datetime,
-            target_offset,
-            selected_fraction,
-        )
-        expected_parsed = parse_metadata_datetime(expected_text)
-        expected_value = (
-            expected_parsed.local_datetime,
-            expected_parsed.utc_offset_minutes,
-        )
-        if (
-            parsed.local_datetime,
-            parsed.utc_offset_minutes,
-        ) == expected_value:
-            continue
-
-        add_correction_operation(
-            operations,
-            skipped,
+        target_key = target.removesuffix("#")
+        target_groups.setdefault(target_key, []).append(
             {
-                "target": write_target,
-                "value": expected_text,
-                "kind": "datetime",
-                "expected": expected_value,
+                "metadata_key": metadata_key,
+                "groups": groups,
                 "tag_name": tag_name,
-            },
+                "raw_value": raw_value,
+                "target": target,
+                "invalid_record": invalid_by_metadata_key.get(metadata_key),
+            }
+        )
+
+    operations = []
+    for target_key in sorted(target_groups):
+        target_records = target_groups[target_key]
+        tag_names = {record["tag_name"] for record in target_records}
+        if len(tag_names) != 1:
+            raise OSError(
+                "internal metadata write-plan error: target "
+                f"'{target_key}' maps to several tag roles: "
+                + ", ".join(sorted(tag_names))
+            )
+        tag_name = next(iter(tag_names))
+
+        # Prefer the richest extracted representation when duplicate views expose
+        # different formatting. This affects only serialization; semantic values
+        # always come from the final selected capture state.
+        def representation_rank(record):
+            text = str(record["raw_value"]).strip()
+            date_match = COMPLETE_DATE_TIME_PATTERN.fullmatch(text)
+            time_match = TIME_ONLY_PATTERN.fullmatch(text)
+            match = date_match or time_match
+            has_offset = bool(match and match.group("timezone") is not None)
+            fraction_length = len(match.group("fraction") or "") if match else 0
+            return (
+                0 if has_offset else 1,
+                -fraction_length,
+                record["metadata_key"].casefold(),
+            )
+
+        representative = min(target_records, key=representation_rank)
+        raw_value = representative["raw_value"]
+        operation = None
+
+        # --------------------------------------------------------------------
+        # INVALID UTC REFERENCES: EXPLICIT REPAIR TO THE FINAL UTC INSTANT
+        # --------------------------------------------------------------------
+        if tag_name in UTC_REFERENCE_TAGS:
+            approved_invalid_records = [
+                record["invalid_record"]
+                for record in target_records
+                if record["invalid_record"] is not None
+                and record["invalid_record"].get("repair_approved")
+            ]
+            if not approved_invalid_records or preserve_timezone_metadata:
+                continue
+            if expected_offset is None:
+                skipped.add(f"{target_key} (ambiguous final UTC offset)")
+                continue
+
+            invalid_kinds = {
+                invalid_record["kind"] for invalid_record in approved_invalid_records
+            }
+            if len(invalid_kinds) != 1:
+                raise OSError(
+                    "internal metadata write-plan error: target "
+                    f"'{target_key}' has incompatible UTC component roles"
+                )
+            invalid_kind = next(iter(invalid_kinds))
+            invalid_record = min(
+                approved_invalid_records,
+                key=lambda record: record["metadata_key"].casefold(),
+            )
+            raw_value = invalid_record["raw_value"]
+
+            aware_selected = selected_datetime.replace(
+                tzinfo=timezone(timedelta(minutes=expected_offset))
+            )
+            selected_utc_datetime = aware_selected.astimezone(timezone.utc).replace(
+                tzinfo=None
+            )
+
+            try:
+                if invalid_kind == "utc_datetime":
+                    complete_match = COMPLETE_DATE_TIME_PATTERN.fullmatch(
+                        str(raw_value).strip()
+                    )
+                    if complete_match is not None:
+                        target_offset = (
+                            0 if complete_match.group("timezone") is not None else None
+                        )
+                        expected_text = format_complete_datetime(
+                            raw_value,
+                            selected_utc_datetime,
+                            target_offset,
+                            selected_fraction,
+                        )
+                    else:
+                        expected_text = selected_utc_datetime.strftime(
+                            "%Y:%m:%d %H:%M:%S"
+                        )
+                        if selected_fraction:
+                            expected_text += "." + selected_fraction
+                    expected_parsed = parse_metadata_datetime(expected_text)
+                    expected = (
+                        expected_parsed.local_datetime,
+                        expected_parsed.utc_offset_minutes,
+                    )
+                    operation_kind = "datetime"
+                elif invalid_kind == "utc_date":
+                    if DATE_ONLY_PATTERN.fullmatch(str(raw_value).strip()) is not None:
+                        expected_text = format_date_only(
+                            raw_value, selected_utc_datetime
+                        )
+                    else:
+                        expected_text = selected_utc_datetime.strftime("%Y:%m:%d")
+                    expected = selected_utc_datetime.date()
+                    operation_kind = "date"
+                elif invalid_kind == "utc_time":
+                    time_match = TIME_ONLY_PATTERN.fullmatch(str(raw_value).strip())
+                    if time_match is not None:
+                        target_offset = 0 if time_match.group("timezone") else None
+                        expected_text = format_time_only(
+                            raw_value,
+                            selected_utc_datetime,
+                            target_offset,
+                            selected_fraction,
+                        )
+                    else:
+                        expected_text = selected_utc_datetime.strftime("%H:%M:%S")
+                        if selected_fraction:
+                            expected_text += "." + selected_fraction
+                    expected_parsed = parse_metadata_datetime(expected_text)
+                    expected = (
+                        expected_parsed.local_time,
+                        expected_parsed.utc_offset_minutes,
+                    )
+                    operation_kind = "time"
+                else:
+                    raise ValueError(f"unsupported UTC repair kind: {invalid_kind}")
+            except (TypeError, ValueError):
+                skipped.add(f"{target_key} (could not format approved UTC repair)")
+                continue
+
+            operation = {
+                "target": representative["target"],
+                "value": expected_text,
+                "kind": operation_kind,
+                "expected": expected,
+                "tag_name": tag_name,
+            }
+
+        # --------------------------------------------------------------------
+        # OFFSETS AND DST SETTINGS: ONE FILE/TARGET-LEVEL FINAL VALUE
+        # --------------------------------------------------------------------
+        elif tag_name in ASSOCIATED_OFFSET_FIELDS or tag_name in GLOBAL_OFFSET_TAGS:
+            if preserve_timezone_metadata:
+                continue
+            if tag_name in GLOBAL_OFFSET_TAGS and not file_record["is_capture_media"]:
+                continue
+            if expected_offset is None:
+                skipped.add(f"{target_key} (ambiguous consensus UTC offset)")
+                continue
+
+            actual_offsets = {
+                parse_metadata_offset_minutes(tag_name, record["raw_value"])
+                for record in target_records
+            }
+            if actual_offsets == {expected_offset}:
+                continue
+
+            raw_target = tag_name == "TimeZoneOffset" and isinstance(
+                raw_value, (int, float)
+            )
+            operation = {
+                "target": get_metadata_write_target(
+                    representative["groups"],
+                    tag_name,
+                    raw=raw_target,
+                ),
+                "value": format_metadata_offset_value(
+                    tag_name,
+                    raw_value,
+                    expected_offset,
+                ),
+                "kind": "offset",
+                "expected": expected_offset,
+                "tag_name": tag_name,
+            }
+
+        elif tag_name in DIRECT_DST_TAGS or tag_name in PROFILE_DST_TAGS:
+            if (
+                preserve_timezone_metadata
+                or not file_record["is_capture_media"]
+                or tag_name not in active_dst_tags
+            ):
+                continue
+            if expected_state is None:
+                skipped.add(f"{target_key} (ambiguous final DST state)")
+                continue
+
+            expected_dst = expected_state[0]
+            actual_dst_states = {
+                parse_daylight_saving_value(record["raw_value"])
+                for record in target_records
+            }
+            if actual_dst_states == {expected_dst}:
+                continue
+
+            dst_vocabulary = str(raw_value).strip().casefold()
+            if dst_vocabulary in {"yes", "no"}:
+                target_dst_value = "Yes" if expected_dst else "No"
+            elif dst_vocabulary in {"enabled", "disabled"}:
+                target_dst_value = "Enabled" if expected_dst else "Disabled"
+            elif dst_vocabulary in {"daylight saving", "standard time"}:
+                target_dst_value = (
+                    "Daylight Saving" if expected_dst else "Standard Time"
+                )
+            else:
+                target_dst_value = "On" if expected_dst else "Off"
+
+            operation = {
+                "target": representative["target"],
+                "value": target_dst_value,
+                "kind": "dst",
+                "expected": expected_dst,
+                "tag_name": tag_name,
+            }
+
+        elif tag_name in TIME_CONTEXT_TAGS or tag_name in EXCLUDED_CAPTURE_TIME_TAGS:
+            continue
+
+        # --------------------------------------------------------------------
+        # LOCAL CAPTURE FIELDS: ONE ROLE AND ONE VALUE PER PHYSICAL TARGET
+        # --------------------------------------------------------------------
+        else:
+            valid_representations = []
+            approved_invalid_representations = []
+            unapproved_invalid_present = False
+
+            for record in target_records:
+                invalid_record = record["invalid_record"]
+                try:
+                    parsed = parse_metadata_datetime(record["raw_value"])
+                except ValueError:
+                    parsed = None
+
+                if parsed is not None:
+                    if parsed.local_datetime is not None:
+                        role = "datetime"
+                    elif parsed.local_date is not None:
+                        role = "date"
+                    elif parsed.local_time is not None:
+                        role = "time"
+                    else:
+                        continue
+                    valid_representations.append((role, record, parsed))
+                    continue
+
+                if invalid_record is None:
+                    continue
+                if (
+                    invalid_record.get("repair_approved")
+                    and not preserve_timezone_metadata
+                ):
+                    invalid_role = invalid_record["kind"]
+                    if invalid_role in {"datetime", "date", "time"}:
+                        approved_invalid_representations.append(
+                            (invalid_role, record, invalid_record)
+                        )
+                else:
+                    unapproved_invalid_present = True
+
+            roles = {
+                role
+                for role, _, _ in (
+                    valid_representations + approved_invalid_representations
+                )
+            }
+            if not roles:
+                # Declined/read-only invalid values remain warnings, not failed
+                # correction operations.
+                continue
+            if len(roles) != 1:
+                raise OSError(
+                    "internal metadata write-plan error: target "
+                    f"'{target_key}' has incompatible local time roles: "
+                    + ", ".join(sorted(roles))
+                )
+            role = next(iter(roles))
+
+            role_valid = [entry for entry in valid_representations if entry[0] == role]
+            role_invalid = [
+                entry for entry in approved_invalid_representations if entry[0] == role
+            ]
+            if role_valid:
+                _, representative, parsed = min(
+                    role_valid,
+                    key=lambda entry: representation_rank(entry[1]),
+                )
+                raw_value = representative["raw_value"]
+            else:
+                _, representative, _ = min(
+                    role_invalid,
+                    key=lambda entry: representation_rank(entry[1]),
+                )
+                raw_value = representative["raw_value"]
+                parsed = None
+
+            try:
+                if role == "datetime":
+                    match = COMPLETE_DATE_TIME_PATTERN.fullmatch(str(raw_value).strip())
+                    if match is None:
+                        skipped.add(
+                            f"{target_key} (could not preserve datetime syntax)"
+                        )
+                        continue
+                    existing_offset = (
+                        parsed.utc_offset_minutes if parsed is not None else None
+                    )
+                    has_inline_offset = match.group("timezone") is not None
+                    target_offset = (
+                        (
+                            existing_offset
+                            if preserve_timezone_metadata
+                            else expected_offset
+                        )
+                        if has_inline_offset
+                        else None
+                    )
+                    if has_inline_offset and target_offset is None:
+                        skipped.add(f"{target_key} (ambiguous consensus UTC offset)")
+                        continue
+                    expected_text = format_complete_datetime(
+                        raw_value,
+                        selected_datetime,
+                        target_offset,
+                        selected_fraction,
+                    )
+                    expected_parsed = parse_metadata_datetime(expected_text)
+                    expected = (
+                        expected_parsed.local_datetime,
+                        expected_parsed.utc_offset_minutes,
+                    )
+                    if parsed is not None and (
+                        parsed.local_datetime,
+                        parsed.utc_offset_minutes,
+                        parsed.fraction,
+                    ) == (
+                        expected_parsed.local_datetime,
+                        expected_parsed.utc_offset_minutes,
+                        expected_parsed.fraction,
+                    ):
+                        continue
+
+                elif role == "date":
+                    expected_text = format_date_only(raw_value, selected_datetime)
+                    expected = selected_datetime.date()
+                    if parsed is not None and parsed.local_date == expected:
+                        continue
+
+                else:
+                    match = TIME_ONLY_PATTERN.fullmatch(str(raw_value).strip())
+                    if match is None:
+                        skipped.add(f"{target_key} (could not preserve time syntax)")
+                        continue
+                    existing_offset = (
+                        parsed.utc_offset_minutes if parsed is not None else None
+                    )
+                    has_inline_offset = match.group("timezone") is not None
+                    target_offset = (
+                        (
+                            existing_offset
+                            if preserve_timezone_metadata
+                            else expected_offset
+                        )
+                        if has_inline_offset
+                        else None
+                    )
+                    if has_inline_offset and target_offset is None:
+                        skipped.add(f"{target_key} (ambiguous consensus UTC offset)")
+                        continue
+                    expected_text = format_time_only(
+                        raw_value,
+                        selected_datetime,
+                        target_offset,
+                        selected_fraction,
+                    )
+                    expected_parsed = parse_metadata_datetime(expected_text)
+                    expected = (
+                        expected_parsed.local_time,
+                        expected_parsed.utc_offset_minutes,
+                    )
+                    if parsed is not None and (
+                        parsed.local_time,
+                        parsed.utc_offset_minutes,
+                        parsed.fraction,
+                    ) == (
+                        expected_parsed.local_time,
+                        expected_parsed.utc_offset_minutes,
+                        expected_parsed.fraction,
+                    ):
+                        continue
+            except (TypeError, ValueError):
+                skipped.add(f"{target_key} (could not format final capture value)")
+                continue
+
+            operation = {
+                "target": representative["target"],
+                "value": expected_text,
+                "kind": role,
+                "expected": expected,
+                "tag_name": tag_name,
+            }
+
+        if operation is not None:
+            if operation["target"] is None:
+                raise OSError(
+                    "internal metadata write-plan error: no writable target for "
+                    f"'{target_key}'"
+                )
+            operations.append(operation)
+
+    # One grouped target can emit at most one operation by construction.
+    operation_targets = [
+        operation["target"].removesuffix("#") for operation in operations
+    ]
+    if len(operation_targets) != len(set(operation_targets)):
+        raise OSError(
+            "internal metadata write-plan error: a target was planned more than once"
         )
 
     # ------------------------------------------------------------------------
-    # ALIGN WRITABLE DATE-ONLY/TIME-ONLY COMPONENTS TO CONSENSUS
-    #
-    # Components do not become candidates alone, but can feed Composite values.
-    # Existing parts are corrected independently, so incomplete pairs are fixed
-    # without inventing their missing counterpart. When both parts exist, using
-    # the final consensus for each also preserves midnight/day rollover correctly.
+    # EXECUTE, RETRY INDIVIDUALLY, AND VERIFY SEMANTIC RESULTS
     # ------------------------------------------------------------------------
-    for metadata_key, groups, tag_name, raw_value in records:
-        if (
-            tag_name in TIME_CONTEXT_TAGS
-            or tag_name in UTC_REFERENCE_TAGS
-            or tag_name in EXCLUDED_CAPTURE_TIME_TAGS
-            or "System" in groups
-        ):
-            continue
-
-        write_target = get_metadata_write_target(groups, tag_name)
-        if write_target is None:
-            continue
-
-        try:
-            parsed = parse_metadata_datetime(raw_value)
-        except ValueError:
-            continue
-        if parsed is None or parsed.local_datetime is not None:
-            continue
-
-        if parsed.local_date is not None:
-            expected_date = selected_datetime.date()
-            if parsed.local_date != expected_date:
-                add_correction_operation(
-                    operations,
-                    skipped,
-                    {
-                        "target": write_target,
-                        "value": format_date_only(raw_value, selected_datetime),
-                        "kind": "date",
-                        "expected": expected_date,
-                        "tag_name": tag_name,
-                    },
-                )
-
-        if parsed.local_time is not None:
-            target_offset = (
-                (
-                    parsed.utc_offset_minutes
-                    if preserve_timezone_metadata
-                    else expected_offset
-                )
-                if parsed.utc_offset_minutes is not None
-                else None
-            )
-            if parsed.utc_offset_minutes is not None and target_offset is None:
-                skipped.add(f"{metadata_key} (ambiguous consensus UTC offset)")
-                continue
-
-            expected_text = format_time_only(
-                raw_value,
-                selected_datetime,
-                target_offset,
-                selected_fraction,
-            )
-            expected_parsed = parse_metadata_datetime(expected_text)
-            expected_value = (
-                expected_parsed.local_time,
-                expected_parsed.utc_offset_minutes,
-            )
-            if (
-                parsed.local_time,
-                parsed.utc_offset_minutes,
-            ) == expected_value:
-                continue
-
-            add_correction_operation(
-                operations,
-                skipped,
-                {
-                    "target": write_target,
-                    "value": expected_text,
-                    "kind": "time",
-                    "expected": expected_value,
-                    "tag_name": tag_name,
-                },
-            )
-
-    # ------------------------------------------------------------------------
-    # NORMALIZE EXISTING OFFSETS AGAINST THE FINAL CONSENSUS
-    #
-    # This occurs after consensus and timezone review. Timestamp-associated
-    # offsets follow their local capture fields and may be updated in sidecars;
-    # camera-global offsets describe the selected camera state and are limited to
-    # media files. Missing offsets are never created, and ambiguity causes a skip
-    # instead of a guessed value.
-    # ------------------------------------------------------------------------
-    if expected_offset is not None and not preserve_timezone_metadata:
-        # Timestamp-associated offsets may exist in media or sidecars.
-        for tag_name in sorted(ASSOCIATED_OFFSET_FIELDS):
-            for metadata_key, groups, raw_value in values_by_tag.get(tag_name, []):
-                write_target = get_metadata_write_target(groups, tag_name)
-                if write_target is None:
-                    continue
-                actual_offset = parse_metadata_offset_minutes(tag_name, raw_value)
-                if actual_offset == expected_offset:
-                    continue
-                add_correction_operation(
-                    operations,
-                    skipped,
-                    {
-                        "target": write_target,
-                        "value": format_metadata_offset_value(
-                            tag_name,
-                            raw_value,
-                            expected_offset,
-                        ),
-                        "kind": "offset",
-                        "expected": expected_offset,
-                        "tag_name": tag_name,
-                    },
-                )
-
-        # Camera-global offsets and DST/profile values belong only to image/video
-        # files, including derivative-stem media. Only the selected active
-        # Pentax/Ricoh profile can change; inactive profile/city/selector fields
-        # remain untouched.
-        if file_record["is_capture_media"]:
-            for tag_name in sorted(GLOBAL_OFFSET_TAGS):
-                for metadata_key, groups, raw_value in values_by_tag.get(
-                    tag_name,
-                    [],
-                ):
-                    write_target = get_metadata_write_target(
-                        groups,
-                        tag_name,
-                        raw=(
-                            tag_name == "TimeZoneOffset"
-                            and isinstance(raw_value, (int, float))
-                        ),
-                    )
-                    if write_target is None:
-                        continue
-                    actual_offset = parse_metadata_offset_minutes(
-                        tag_name,
-                        raw_value,
-                    )
-                    if actual_offset == expected_offset:
-                        continue
-                    add_correction_operation(
-                        operations,
-                        skipped,
-                        {
-                            "target": write_target,
-                            "value": format_metadata_offset_value(
-                                tag_name,
-                                raw_value,
-                                expected_offset,
-                            ),
-                            "kind": "offset",
-                            "expected": expected_offset,
-                            "tag_name": tag_name,
-                        },
-                    )
-
-            expected_states = timezone_states_for_local_time(
-                selected_datetime,
-                classification_timezone,
-            )
-            expected_state = expected_states[0] if len(expected_states) == 1 else None
-            if expected_state is not None:
-                expected_dst = expected_state[0]
-                dst_tags = set(DIRECT_DST_TAGS)
-                dst_tags.update(
-                    active_dst_tag
-                    for _, _, active_dst_tag, _ in (
-                        resolve_active_timezone_profiles(values_by_tag)
-                    )
-                )
-
-                for tag_name in sorted(dst_tags):
-                    for metadata_key, groups, raw_value in values_by_tag.get(
-                        tag_name,
-                        [],
-                    ):
-                        write_target = get_metadata_write_target(
-                            groups,
-                            tag_name,
-                        )
-                        if write_target is None:
-                            continue
-                        actual_dst = parse_daylight_saving_value(raw_value)
-                        if actual_dst == expected_dst:
-                            continue
-
-                        # Write through ExifTool's normal PrintConv path. Preserve
-                        # the vocabulary already exposed for this tag while letting
-                        # ExifTool perform the tag-specific inverse conversion.
-                        dst_vocabulary = str(raw_value).strip().casefold()
-                        if dst_vocabulary in {"yes", "no"}:
-                            target_dst_value = "Yes" if expected_dst else "No"
-                        elif dst_vocabulary in {"enabled", "disabled"}:
-                            target_dst_value = "Enabled" if expected_dst else "Disabled"
-                        elif dst_vocabulary in {
-                            "daylight saving",
-                            "standard time",
-                        }:
-                            target_dst_value = (
-                                "Daylight Saving" if expected_dst else "Standard Time"
-                            )
-                        else:
-                            target_dst_value = "On" if expected_dst else "Off"
-
-                        add_correction_operation(
-                            operations,
-                            skipped,
-                            {
-                                "target": write_target,
-                                "value": target_dst_value,
-                                "kind": "dst",
-                                "expected": expected_dst,
-                                "tag_name": tag_name,
-                            },
-                        )
-    elif not preserve_timezone_metadata:
-        for tag_name in sorted(ASSOCIATED_OFFSET_FIELDS | GLOBAL_OFFSET_TAGS):
-            if values_by_tag.get(tag_name):
-                skipped.add(f"{tag_name} (ambiguous consensus UTC offset)")
-
-    # When review explicitly kept contradictory timezone/DST evidence, reaching
-    # this point without offset or DST operations is intentional—not a skipped or
-    # failed correction. FileModifyDate remains handled independently below.
-
-    # ------------------------------------------------------------------------
-    # EXECUTE EXIFTOOL WRITES, RETRY INDIVIDUALLY, AND VERIFY
-    #
-    # Mixed files may contain writable standard tags and read-only maker tags.
-    # The combined write is attempted first for consistency and efficiency.
-    # Individual retries then prevent one unsupported maker-note field from
-    # blocking common EXIF/XMP/IPTC/QuickTime updates that ExifTool can write.
-    # Every requested target is reread afterward and compared semantically.
-    # ------------------------------------------------------------------------
-    operation_list = list(operations.values())
-    if operation_list:
+    if operations:
         write_arguments = list(CORRECTION_WRITE_PARAMS)
         write_arguments.extend(
-            f"-{operation['target']}={operation['value']}"
-            for operation in operation_list
+            f"-{operation['target']}={operation['value']}" for operation in operations
         )
         write_arguments.append(str(copied_file))
         try:
             metadata_reader.execute(*write_arguments)
         except ExifToolException:
-            for operation in operation_list:
+            for operation in operations:
                 try:
                     metadata_reader.execute(
                         *CORRECTION_WRITE_PARAMS,
@@ -2465,13 +2867,10 @@ def update_copied_file_metadata_and_system_times(
             if target is not None:
                 actual_by_target.setdefault(target, []).append(raw_value)
 
-        for operation in operation_list:
+        for operation in operations:
             target = operation["target"].removesuffix("#")
             matched = False
             expected = operation["expected"]
-            # ExifTool may normalize separators, raw encodings, and numeric text.
-            # Reparse the actual value according to the operation's semantics
-            # instead of requiring byte-for-byte equality with the write argument.
             for actual_value in actual_by_target.get(target, []):
                 try:
                     if operation["kind"] == "datetime":
@@ -2479,6 +2878,7 @@ def update_copied_file_metadata_and_system_times(
                         expected_datetime, expected_offset_value = expected
                         matched = (
                             parsed is not None
+                            and parsed.local_datetime is not None
                             and parsed.local_datetime.replace(microsecond=0)
                             == expected_datetime.replace(microsecond=0)
                             and parsed.utc_offset_minutes == expected_offset_value
@@ -2491,6 +2891,7 @@ def update_copied_file_metadata_and_system_times(
                         expected_time, expected_offset_value = expected
                         matched = (
                             parsed is not None
+                            and parsed.local_time is not None
                             and parsed.local_time.replace(microsecond=0)
                             == expected_time.replace(microsecond=0)
                             and parsed.utc_offset_minutes == expected_offset_value
@@ -2516,15 +2917,21 @@ def update_copied_file_metadata_and_system_times(
                 skipped.add(f"{target} (not writable or verification failed)")
 
     # ------------------------------------------------------------------------
-    # ALIGN FILEMODIFYDATE ONLY FOR PRIMARY/DERIVATIVE IMAGE AND VIDEO COPIES
-    #
-    # FileModifyDate is widely consumed by file browsers and media software, so
-    # it is set to the absolute final capture instant—not shifted by a delta from
-    # an unrelated source-file modification time. Primary and derivative media
-    # copies are aligned; sidecars keep their copied filesystem timestamp. Access
-    # time is set to the current time and is not part of the metadata policy.
+    # ALIGN FILEMODIFYDATE FOR CLASSIFIED MEDIA, WITH INVALID-VALUE CONSENT
     # ------------------------------------------------------------------------
-    if file_record["is_capture_media"]:
+    invalid_file_modify_records = [
+        invalid_record
+        for invalid_record in file_record.get("invalid_capture_records", [])
+        if invalid_record["kind"] == "file_modify"
+    ]
+    file_modify_repair_allowed = not invalid_file_modify_records or (
+        not preserve_timezone_metadata
+        and any(
+            invalid_record.get("repair_approved")
+            for invalid_record in invalid_file_modify_records
+        )
+    )
+    if file_record["is_capture_media"] and file_modify_repair_allowed:
         if expected_offset is None:
             skipped.add("FileModifyDate (ambiguous consensus UTC offset)")
         else:
@@ -2760,9 +3167,13 @@ def copy_related_files_to_output(
                 for invalid_record in invalid_records
                 if invalid_record.get("repair_approved")
                 for target in [
-                    get_metadata_write_target(
-                        invalid_record["groups"],
-                        invalid_record["tag_name"],
+                    (
+                        "FileModifyDate"
+                        if invalid_record["kind"] == "file_modify"
+                        else get_metadata_write_target(
+                            invalid_record["groups"],
+                            invalid_record["tag_name"],
+                        )
                     )
                 ]
                 if target is not None
@@ -2774,7 +3185,7 @@ def copy_related_files_to_output(
             else:
                 invalid_status = "left unchanged"
             warning_messages.append(
-                f"invalid capture metadata ({invalid_labels}); {invalid_status}"
+                f"invalid date/time metadata ({invalid_labels}); {invalid_status}"
             )
 
         print()
@@ -2951,7 +3362,6 @@ def main():
             # ----------------------------------------------------------------
             review_and_correct_timezone_and_dst(
                 capture_time_consensus,
-                related_files_metadata,
                 timezone_name,
                 classification_timezone,
                 automatic_correction_rules,
@@ -2962,7 +3372,8 @@ def main():
             #
             # An invalid value never becomes a consensus candidate. Repair is
             # offered only when another valid capture state exists and only after
-            # timezone review has established the final timestamp. A Keep decision
+            # timezone review has established the final timestamp. This applies to
+            # local, UTC-reference, and FileModifyDate values. A Keep decision
             # leaves every invalid field untouched, including inline offset text.
             # ----------------------------------------------------------------
             if capture_time_consensus["datetime"] is not None:
@@ -2996,7 +3407,11 @@ def main():
                     writable_records = [
                         invalid_record
                         for invalid_record in invalid_records
-                        if get_metadata_write_target(
+                        if (
+                            invalid_record["kind"] == "file_modify"
+                            and file_record["is_capture_media"]
+                        )
+                        or get_metadata_write_target(
                             invalid_record["groups"],
                             invalid_record["tag_name"],
                         )
