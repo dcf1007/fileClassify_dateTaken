@@ -83,10 +83,6 @@ EXCLUDED_CAPTURE_TIME_TAGS = {
     "ExtensionModifyDate",
 }
 
-PARTIAL_DATE_TIME_PAIRS = (
-    ("DateCreated", "TimeCreated"),
-    ("DigitalCreationDate", "DigitalCreationTime"),
-)
 
 ASSOCIATED_OFFSET_TAGS = {
     "DateTimeOriginal": "OffsetTimeOriginal",
@@ -718,7 +714,6 @@ def read_related_files_metadata(metadata_reader, primary_stem, related_files):
             "metadata": {},
             "records": [],
             "capture_candidates": [],
-            "partial_values": {},
             "timezone_context": [],
             "utc_references": [],
             "file_modify_candidate": None,
@@ -832,19 +827,6 @@ def read_related_files_metadata(metadata_reader, primary_stem, related_files):
                         ),
                     }
                 )
-            elif parsed.local_date is not None or parsed.local_time is not None:
-                file_record["partial_values"].setdefault(
-                    (family_key, tag_name),
-                    [],
-                ).append(
-                    {
-                        "metadata_key": metadata_key,
-                        "groups": groups,
-                        "tag_name": tag_name,
-                        "raw_value": raw_value,
-                        "parsed": parsed,
-                    }
-                )
 
         mime_is_image = mime_type is not None and mime_type.startswith("image/")
         mime_is_video = mime_type is not None and mime_type.startswith("video/")
@@ -938,50 +920,6 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
 
     for source_file, file_record in related_files_metadata["files"].items():
         candidates = list(file_record["capture_candidates"])
-
-        # --------------------------------------------------------------------
-        # COMBINE KNOWN WRITABLE IPTC DATE/TIME PAIRS
-        # --------------------------------------------------------------------
-        partial_values = file_record["partial_values"]
-        family_keys = {family_key for family_key, _ in partial_values}
-        for family_key in family_keys:
-            for date_tag, time_tag in PARTIAL_DATE_TIME_PAIRS:
-                date_records = partial_values.get((family_key, date_tag), [])
-                time_records = partial_values.get((family_key, time_tag), [])
-                if len(date_records) != 1 or len(time_records) != 1:
-                    continue
-
-                date_record = date_records[0]
-                time_record = time_records[0]
-                try:
-                    parsed_pair = parse_metadata_datetime(
-                        date_record["raw_value"],
-                        time_record["raw_value"],
-                    )
-                except ValueError:
-                    parsed_pair = None
-                if parsed_pair is None or parsed_pair.local_datetime is None:
-                    continue
-
-                candidates.append(
-                    {
-                        "date_type": 1,
-                        "datetime": parsed_pair.local_datetime,
-                        "source": (
-                            f"{date_record['metadata_key']} + "
-                            f"{time_record['metadata_key']}"
-                        ),
-                        "offset_minutes": parsed_pair.utc_offset_minutes,
-                        "tag_name": f"{date_tag}+{time_tag}",
-                        "groups": list(family_key),
-                        "raw_value": (
-                            date_record["raw_value"],
-                            time_record["raw_value"],
-                        ),
-                        "writable_target": None,
-                        "kind": "paired",
-                    }
-                )
 
         if candidates:
             candidates_by_file[source_file] = candidates
@@ -1647,7 +1585,7 @@ def update_copied_file_metadata_and_system_times(
         )
 
     # ------------------------------------------------------------------------
-    # ALIGN WRITABLE DATE-ONLY/TIME-ONLY COMPONENTS THAT CAN FEED COMPOSITES
+    # ALIGN WRITABLE DATE-ONLY/TIME-ONLY COMPONENTS TO CONSENSUS
     # ------------------------------------------------------------------------
     for metadata_key, groups, tag_name, raw_value in records:
         if (
