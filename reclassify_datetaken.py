@@ -54,26 +54,33 @@ COPY_CHUNK_SIZE = 1024 * 1024
 
 # ``Time:All`` discovers standard EXIF, maker-note, XMP, IPTC,
 # QuickTime, and calculated Composite fields without camera make/model
-# dispatch. The explicit tags below add timezone evidence that may not be
-# exposed by ``Time:All`` in every file. ExifTool System timestamps are excluded
+# dispatch. The extra tags are requested by meaning rather than by brand, so
+# metadata from unknown or future cameras follows the same path as metadata
+# from currently recognized makers. ExifTool System timestamps are excluded
 # from this broad read; ``FileModifyDate`` is requested separately so only
 # exact-primary-stem image/video files can contribute it to consensus.
 EXIFTOOL_TAGS = [
     "Time:All",
     "File:FileType",
     "File:MIMEType",
+    # Generic camera daylight-saving configuration used by several makers.
     "DaylightSavings#",
+    # Pentax/Ricoh travel profiles. WorldTimeLocation selects the active
+    # Hometown or Destination profile; no Make/Model dispatch is required.
     "WorldTimeLocation#",
     "HometownDST#",
     "DestinationDST#",
     "HometownCity",
     "DestinationCity",
+    # Standard and maker-note UTC-offset context.
     "OffsetTimeOriginal",
     "OffsetTimeDigitized",
     "TimeZoneOffset",
     "TimeZone",
     "TimeZoneCity",
     "TimeOffset",
+    # UTC counterparts exposed by Olympus/OM System, GPS-enabled cameras,
+    # phones, GoPro, DJI, and any other file for which ExifTool provides them.
     "DateTimeUTC",
     "GPSDateTime",
 ]
@@ -84,8 +91,10 @@ FILE_MODIFY_DATE_PARAMS = []
 # These fields describe editing, metadata history, device operation,
 # runtime, profile resources, or recording end points rather than original
 # capture. They remain untouched: they are neither consensus candidates nor
-# correction targets. UTC-reference tags are handled separately because they
-# are offset evidence, not local wall-clock choices.
+# correction targets. Capture-oriented local fields such as SonyDateTime,
+# PanasonicDateTime, RicohDate, and ordinary EXIF/XMP creation dates remain
+# eligible. UTC-reference tags are handled separately because they are offset
+# evidence, not local wall-clock choices.
 EXCLUDED_CAPTURE_TIME_TAGS = {
     "PowerUpTime",
     "TimeSincePowerOn",
@@ -107,9 +116,16 @@ EXCLUDED_CAPTURE_TIME_TAGS = {
 }
 
 
+# Correction is driven by timestamp semantics rather than camera make. Every
+# eligible local wall-clock field is normalized to the final consensus; an
+# existing inline or separate offset is normalized to the final timezone state,
+# while UTC-reference timestamps remain unchanged. The write pass never creates
+# missing date/time or offset fields.
+#
 # Standard associated offsets belong to particular local timestamps and may
-# also exist in writable sidecars. Existing values follow the final consensus
-# offset, but missing fields are never created.
+# also exist in writable sidecars. DateTimeOriginal uses OffsetTimeOriginal and
+# CreateDate uses OffsetTimeDigitized. ModifyDate/OffsetTime are intentionally
+# absent because modification metadata is excluded from capture correction.
 ASSOCIATED_OFFSET_TAGS = {
     "DateTimeOriginal": "OffsetTimeOriginal",
     "CreateDate": "OffsetTimeDigitized",
@@ -153,9 +169,11 @@ UTC_REFERENCE_TAGS = {
 }
 
 # ``-wm w`` updates existing metadata only. This prevents the correction
-# pass from inventing fields absent from the original representation. ``-P``
-# preserves the host timestamp during embedded writes; FileModifyDate is set
-# explicitly afterward only when the copied file is image/video capture media.
+# pass from inventing fields absent from the original representation. Absolute
+# final values are written rather than relative deltas, making every operation
+# independently verifiable. ``-P`` preserves the host timestamp during embedded
+# writes; FileModifyDate is set explicitly afterward only when the copied file
+# is image/video capture media.
 CORRECTION_WRITE_PARAMS = [
     "-overwrite_original_in_place",
     "-P",
@@ -446,7 +464,12 @@ def parse_active_world_time_profile(metadata_value):
 
 
 def format_offset(offset_minutes):
-    """Format integer offset minutes as +HH:MM or -HH:MM."""
+    """
+    Format integer offset minutes as the metadata form +HH:MM or -HH:MM.
+
+    User-facing callers prepend ``UTC`` themselves; embedded EXIF/XMP offset
+    fields store only the signed numeric portion.
+    """
     sign = "+" if offset_minutes >= 0 else "-"
     absolute_minutes = abs(offset_minutes)
     hours, minutes = divmod(absolute_minutes, 60)
@@ -545,9 +568,11 @@ def get_metadata_write_target(groups, tag_name, raw=False):
 # ============================================================================
 #
 # Local timestamps remain naive until evaluated against the selected IANA zone.
-# Civil-time rules must preserve repeated autumn times (two valid folds), reject
-# nonexistent spring-forward times (no valid state), and avoid guessing when a
-# wall clock cannot be mapped to one absolute instant.
+# This section converts inline offsets, standalone offsets, UTC counterparts,
+# and camera configuration into generic evidence, then keeps the user-facing
+# timezone/DST decision in one place. Civil-time rules preserve repeated autumn
+# times (two valid folds), reject nonexistent spring-forward times (no valid
+# state), and avoid guessing when a wall clock cannot map to one absolute instant.
 
 
 def request_classification_timezone():
@@ -679,7 +704,12 @@ def resolve_filesystem_timestamp_offset(
 
 
 def local_datetime_to_epoch_nanoseconds(local_datetime, offset_minutes):
-    """Convert one local datetime and explicit offset to Unix nanoseconds."""
+    """
+    Convert one local datetime and explicit offset to Unix nanoseconds.
+
+    Integer arithmetic avoids the rounding that can occur when a filesystem
+    timestamp is constructed through a floating-point POSIX timestamp.
+    """
     aware_datetime = local_datetime.replace(
         tzinfo=timezone(timedelta(minutes=offset_minutes))
     )
@@ -1175,6 +1205,10 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
         if rejected_values:
             rejected_datetimes_by_file[source_file] = rejected_values
 
+    # A unique offset attached to the chosen value is retained as the preferred
+    # interpretation of an ambiguous autumn fold and as the absolute basis for
+    # FileModifyDate. Conflicting or absent attached offsets deliberately leave
+    # the preference unset so timezone-database ambiguity is not hidden.
     selected_offsets = {
         record[2] for record in selected_option.get("offset_records", [])
     }
@@ -1232,6 +1266,10 @@ def review_and_correct_timezone_and_dst(
 
     # ------------------------------------------------------------------------
     # OFFSETS ATTACHED DIRECTLY TO THE SELECTED CONSENSUS VALUE
+    #
+    # These are the strongest offset evidence because they belong to the exact
+    # timestamp the user selected. They may legitimately originate in a writable
+    # XMP sidecar that supplied the selected value.
     # ------------------------------------------------------------------------
     for source_file, source_name, offset_minutes in capture_time_consensus.get(
         "offset_records",
@@ -1249,6 +1287,11 @@ def review_and_correct_timezone_and_dst(
 
     # ------------------------------------------------------------------------
     # CAMERA CONFIGURATION AND UTC REFERENCES FROM PRIMARY CAPTURE MEDIA
+    #
+    # Camera settings and UTC counterparts are restricted to exact-primary-stem
+    # image/video files. Sidecars and derivative media may carry useful capture
+    # timestamps, but they cannot define what the original camera was configured
+    # to do. Their copied settings may still be normalized after consensus.
     # ------------------------------------------------------------------------
     for source_file in related_files_metadata["primary_capture_media"]:
         file_record = related_files_metadata["files"].get(source_file)
@@ -1331,6 +1374,9 @@ def review_and_correct_timezone_and_dst(
                     )
                 )
 
+    # Collapse repeated telemetry without losing distinct filenames or source
+    # tags. The full tuples are deduplicated, so identical values from different
+    # metadata fields remain visible in the review output.
     dst_records = list(dict.fromkeys(dst_records))
     offset_records = list(dict.fromkeys(offset_records))
     display_records = list(dict.fromkeys(display_records))
@@ -1430,6 +1476,10 @@ def review_and_correct_timezone_and_dst(
                     f"to UTC{format_offset(expected_offset)}"
                 )
 
+        # A stale DST flag can exist without a usable mismatching offset. Only
+        # when offset-derived options produced no correction do we offer the
+        # timezone database's real yearly DST adjustment. This is weaker evidence
+        # than an attached/derived offset and remains an explicit user choice.
         if not correction_reasons and len(recorded_dst_states) == 1:
             if len(expected_dst_states) == 1 and mismatched_dst:
                 expected_dst = next(iter(expected_dst_states))
@@ -1588,7 +1638,13 @@ def add_correction_operation(operations, skipped, operation):
 
 
 def format_metadata_offset_value(tag_name, original_value, offset_minutes):
-    """Preserve a standalone offset field's representation where practical."""
+    """
+    Preserve a standalone offset field's representation where practical.
+
+    Numeric TimeZoneOffset values remain numeric hours and are written through
+    ExifTool's raw-value target. Text fields retain surrounding maker text when
+    it contains one replaceable signed offset.
+    """
     if tag_name == "TimeZoneOffset" and isinstance(original_value, (int, float)):
         numeric_hours = offset_minutes / 60
         return (
@@ -1689,8 +1745,10 @@ def update_copied_file_metadata_and_system_times(
 
     The final consensus is authoritative. Existing writable complete capture
     timestamps and existing writable date-only/time-only components are aligned
-    to it. Composite, System, File, UTC-reference, editing/history/runtime, and
-    other excluded fields are never direct targets. Missing fields are not made.
+    to it. This is an absolute normalization, not a delta applied to an unrelated
+    original value. Composite, System, File, UTC-reference,
+    editing/history/runtime, and other excluded fields are never direct targets.
+    Missing fields are not made.
 
     Timestamp-associated offsets may be updated in media or sidecars. Camera-
     global offsets and active DST/profile values are updated only in primary or
@@ -1716,6 +1774,10 @@ def update_copied_file_metadata_and_system_times(
         capture_time_consensus.get("preferred_utc_offset_minutes"),
     )
 
+    # Keep duplicate values scoped to their complete ExifTool family path.
+    # ``values_by_tag`` is also built for context fields whose semantics are
+    # intentionally independent of one storage family. Copy* extraction labels
+    # are ignored because they are duplicate-instance markers, not write groups.
     records_by_family_tag = {}
     values_by_tag = {}
     for metadata_key, groups, tag_name, raw_value in records:
@@ -1732,8 +1794,11 @@ def update_copied_file_metadata_and_system_times(
     # ------------------------------------------------------------------------
     # ALIGN EVERY WRITABLE ELIGIBLE COMPLETE CAPTURE TIMESTAMP TO CONSENSUS
     #
-    # An inline offset is replaced only if the original field already had one.
-    # Naive local timestamps remain naive; no offset field is invented.
+    # Rejected values and other eligible local capture fields all receive the
+    # final selected wall clock. An inline offset is replaced only if that field
+    # already had one; naive values remain naive. A separate OffsetTime* value is
+    # handled in the later offset section, so timestamp and attached offset reach
+    # the same final state without inventing either representation.
     # ------------------------------------------------------------------------
     for metadata_key, groups, tag_name, raw_value in records:
         if (
@@ -1794,7 +1859,8 @@ def update_copied_file_metadata_and_system_times(
     #
     # Components do not become candidates alone, but can feed Composite values.
     # Existing parts are corrected independently, so incomplete pairs are fixed
-    # without inventing their missing counterpart.
+    # without inventing their missing counterpart. When both parts exist, using
+    # the final consensus for each also preserves midnight/day rollover correctly.
     # ------------------------------------------------------------------------
     for metadata_key, groups, tag_name, raw_value in records:
         if (
@@ -1863,8 +1929,11 @@ def update_copied_file_metadata_and_system_times(
     # ------------------------------------------------------------------------
     # NORMALIZE EXISTING OFFSETS AGAINST THE FINAL CONSENSUS
     #
-    # This occurs after consensus and timezone review. Missing offsets are never
-    # created, and ambiguity causes a skip instead of a guessed value.
+    # This occurs after consensus and timezone review. Timestamp-associated
+    # offsets follow their local capture fields and may be updated in sidecars;
+    # camera-global offsets describe the selected camera state and are limited to
+    # media files. Missing offsets are never created, and ambiguity causes a skip
+    # instead of a guessed value.
     # ------------------------------------------------------------------------
     if expected_offset is not None:
         # Timestamp-associated offsets may exist in media or sidecars.
@@ -1998,8 +2067,10 @@ def update_copied_file_metadata_and_system_times(
     # EXECUTE EXIFTOOL WRITES, RETRY INDIVIDUALLY, AND VERIFY
     #
     # Mixed files may contain writable standard tags and read-only maker tags.
-    # Individual retries prevent one unsupported field from blocking all safe
-    # EXIF/XMP/IPTC/QuickTime updates.
+    # The combined write is attempted first for consistency and efficiency.
+    # Individual retries then prevent one unsupported maker-note field from
+    # blocking common EXIF/XMP/IPTC/QuickTime updates that ExifTool can write.
+    # Every requested target is reread afterward and compared semantically.
     # ------------------------------------------------------------------------
     operation_list = list(operations.values())
     if operation_list:
@@ -2053,8 +2124,11 @@ def update_copied_file_metadata_and_system_times(
     # ------------------------------------------------------------------------
     # ALIGN FILEMODIFYDATE ONLY FOR PRIMARY/DERIVATIVE IMAGE AND VIDEO COPIES
     #
-    # Sidecars keep their copied filesystem timestamp. Access time is set to the
-    # current time; only modification time represents the final capture instant.
+    # FileModifyDate is widely consumed by file browsers and media software, so
+    # it is set to the absolute final capture instant—not shifted by a delta from
+    # an unrelated source-file modification time. Primary and derivative media
+    # copies are aligned; sidecars keep their copied filesystem timestamp. Access
+    # time is set to the current time and is not part of the metadata policy.
     # ------------------------------------------------------------------------
     if file_record["is_capture_media"]:
         if expected_offset is None:
