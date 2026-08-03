@@ -272,19 +272,15 @@ def clean_input_path(raw_path):
 # or time components.
 
 
-def split_metadata_key(metadata_key):
-    """Split a -G0:1:4 ExifTool key into group path and final tag name."""
-    key_parts = metadata_key.split(":")
-    return key_parts[:-1], key_parts[-1]
-
-
 def iter_metadata_values(metadata):
     """Yield one item for every scalar or list value returned by ExifTool."""
     for metadata_key, metadata_value in metadata.items():
         if metadata_key == "SourceFile":
             continue
 
-        groups, tag_name = split_metadata_key(metadata_key)
+        key_parts = metadata_key.split(":")
+        groups = key_parts[:-1]
+        tag_name = key_parts[-1]
         values = (
             metadata_value if isinstance(metadata_value, list) else [metadata_value]
         )
@@ -292,39 +288,6 @@ def iter_metadata_values(metadata):
         for value in values:
             if value is not None:
                 yield metadata_key, groups, tag_name, value
-
-
-def get_metadata_values(metadata, tag_name):
-    """Return all values whose final ExifTool tag name matches tag_name."""
-    return [
-        value
-        for _, _, current_tag_name, value in iter_metadata_values(metadata)
-        if current_tag_name == tag_name
-    ]
-
-
-def get_first_metadata_value(metadata, tag_name):
-    """Return the first value for a requested ExifTool tag, or None."""
-    values = get_metadata_values(metadata, tag_name)
-    return values[0] if values else None
-
-
-def is_image_file(filename, metadata):
-    """Return True when ExifTool or the filename identifies an image."""
-    mime_type = get_first_metadata_value(metadata, "MIMEType")
-    if isinstance(mime_type, str) and mime_type.casefold().startswith("image/"):
-        return True
-    return filename.suffix.casefold() in IMAGE_EXTENSIONS
-
-
-def is_capture_media_file(filename, metadata):
-    """Identify base image/video files that may supply timezone evidence."""
-    mime_type = get_first_metadata_value(metadata, "MIMEType")
-    if isinstance(mime_type, str):
-        folded_mime = mime_type.casefold()
-        if folded_mime.startswith(("image/", "video/")):
-            return True
-    return filename.suffix.casefold() in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 
 
 def parse_timezone_offset_minutes(timezone_text):
@@ -535,11 +498,6 @@ def format_time_only(original_value, local_datetime, offset_minutes=None):
     return formatted
 
 
-def normalize_target(target):
-    """Remove ExifTool's raw-value suffix for read-back comparisons."""
-    return target[:-1] if target.endswith("#") else target
-
-
 def read_correction_metadata(metadata_reader, filename):
     """Read all existing date/time and timezone fields used by correction."""
     try:
@@ -600,8 +558,8 @@ def get_dates(metadata_reader, filename):
         return [], None, False, [], [], False
 
     metadata = metadata_results[0]
-    file_is_image = is_image_file(filename, metadata)
-    file_is_capture_media = is_capture_media_file(filename, metadata)
+    file_extension = filename.suffix.casefold()
+    mime_type = None
     date_candidates = []
     context_records = []
     utc_records = []
@@ -628,7 +586,11 @@ def get_dates(metadata_reader, filename):
                 context_records.append(context_record)
             continue
 
-        if tag_name in {"FileType", "MIMEType"}:
+        if tag_name == "MIMEType":
+            if mime_type is None and isinstance(metadata_value, str):
+                mime_type = metadata_value.casefold()
+            continue
+        if tag_name == "FileType":
             continue
         if "System" in groups or tag_name in EXCLUDED_TIME_TAGS:
             continue
@@ -651,6 +613,15 @@ def get_dates(metadata_reader, filename):
                 timezone_offset_minutes,
             )
         )
+
+    mime_is_image = mime_type is not None and mime_type.startswith("image/")
+    mime_is_video = mime_type is not None and mime_type.startswith("video/")
+    file_is_image = mime_is_image or file_extension in IMAGE_EXTENSIONS
+    file_is_capture_media = (
+        mime_is_image
+        or mime_is_video
+        or file_extension in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+    )
 
     if invalid_date_messages and file_is_image:
         return (
@@ -688,9 +659,15 @@ def get_file_modify_date(metadata_reader, filename):
     if not metadata_results:
         return None, "ExifTool returned no FileModifyDate"
 
-    modification_date_text = get_first_metadata_value(
-        metadata_results[0],
-        "FileModifyDate",
+    modification_date_text = next(
+        (
+            metadata_value
+            for _, _, tag_name, metadata_value in iter_metadata_values(
+                metadata_results[0]
+            )
+            if tag_name == "FileModifyDate"
+        ),
+        None,
     )
     if modification_date_text is None:
         return None, "ExifTool returned no FileModifyDate"
@@ -867,7 +844,7 @@ def system_datetime_to_epoch_ns(local_datetime, offset_minutes):
     ) * 1_000_000_000 + delta.microseconds * 1000
 
 
-def format_records_by_file(records):
+def format_labels_by_file(records):
     """Format prebuilt evidence labels with each filename shown once."""
     labels_by_file = {}
     for filename, label in records:
@@ -1105,7 +1082,7 @@ def review_timezone_evidence(
     if dst_records:
         print(
             "  Camera DST settings: "
-            + format_records_by_file(
+            + format_labels_by_file(
                 [
                     (
                         filename,
@@ -1119,7 +1096,7 @@ def review_timezone_evidence(
     if offset_records:
         print(
             "  Offset/UTC evidence: "
-            + format_records_by_file(
+            + format_labels_by_file(
                 [
                     (
                         filename,
@@ -1139,7 +1116,7 @@ def review_timezone_evidence(
         )
 
     if display_records:
-        print("  Camera timezone context: " + format_records_by_file(display_records))
+        print("  Camera timezone context: " + format_labels_by_file(display_records))
 
     correction_reasons = {}
 
@@ -1312,7 +1289,7 @@ def review_timezone_evidence(
 
 def add_correction_operation(operations, skipped, operation):
     """Add one absolute write, rejecting ambiguous duplicate target values."""
-    target_key = normalize_target(operation["target"])
+    target_key = operation["target"].removesuffix("#")
     existing = operations.get(target_key)
     if existing is None:
         operations[target_key] = operation
@@ -1975,7 +1952,7 @@ def execute_correction_operations(metadata_reader, filename, operations):
                         str(filename),
                     )
                 except ExifToolException as error:
-                    skipped.add(f"{normalize_target(operation['target'])} ({error})")
+                    skipped.add(f"{operation['target'].removesuffix('#')} ({error})")
 
     destination_metadata = read_correction_metadata(metadata_reader, filename)
     actual_by_target = {}
@@ -1988,7 +1965,7 @@ def execute_correction_operations(metadata_reader, filename, operations):
 
     updated = []
     for operation in operations:
-        target = normalize_target(operation["target"])
+        target = operation["target"].removesuffix("#")
         if operation_matches(operation, actual_by_target.get(target, [])):
             updated.append(target)
         else:
@@ -2061,20 +2038,6 @@ def update_corrected_copy_metadata(
 # Date options are assembled and displayed here. The workflow records rejected
 # embedded values so only relevant capture/creation fields are normalized
 # after the user chooses the authoritative date.
-
-
-def format_date_sources(sources):
-    """Format one timestamp's source fields with each filename shown once."""
-    fields_by_file = {}
-    for filename, source_name in sources:
-        source_fields = fields_by_file.setdefault(filename, [])
-        if source_name not in source_fields:
-            source_fields.append(source_name)
-
-    return ", ".join(
-        f"{filename.name} ({', '.join(source_fields)})"
-        for filename, source_fields in fields_by_file.items()
-    )
 
 
 def build_date_options(file_dates):
@@ -2151,7 +2114,7 @@ def choose_group_date(date_options, same_stem_files, file_dates):
         print(
             f"  {option_number}. "
             f"{date_value.strftime('%Y-%m-%d %H:%M:%S')} - "
-            f"{format_date_sources(date_option['sources'])}"
+            f"{format_labels_by_file(date_option['sources'])}"
         )
 
     while True:
@@ -2415,19 +2378,6 @@ def start_metadata_reader():
         )
         input("Press Enter to exit")
         raise SystemExit(1)
-
-
-def create_run_stats():
-    """Return counters used for the final execution summary."""
-    return {
-        "copied": 0,
-        "duplicates": 0,
-        "renamed": 0,
-        "review": 0,
-        "failed": 0,
-        "metadata_updated": 0,
-        "metadata_skipped": 0,
-    }
 
 
 def scan_related_group(metadata_reader, base_stem, same_stem_files):
@@ -2810,7 +2760,15 @@ def run_classification(
     """Process all related groups through one persistent ExifTool session."""
     same_stem_groups = group_related_files(source_files)
     metadata_reader = start_metadata_reader()
-    stats = create_run_stats()
+    stats = {
+        "copied": 0,
+        "duplicates": 0,
+        "renamed": 0,
+        "review": 0,
+        "failed": 0,
+        "metadata_updated": 0,
+        "metadata_skipped": 0,
+    }
     automatic_correction_rules = set()
 
     try:
