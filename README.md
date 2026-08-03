@@ -48,6 +48,11 @@ The remaining timestamps may come from EXIF, XMP, IPTC, QuickTime, maker notes, 
 
 When distinct complete embedded timestamps are found anywhere in a related group, the script lists their full ExifTool source paths and asks the user to choose one. Each filename is displayed once per option, followed by all matching fields for that file. Duplicate occurrences of the same field are collapsed.
 
+
+After the user chooses the authoritative value, the classified copies are normalized to that decision. For each file, eligible capture/creation fields carrying one of the rejected complete timestamps are rewritten to the chosen timestamp. Paired IPTC date/time components are updated together, and derived Composite values follow the corrected underlying fields. Existing inline or separate UTC offsets and writable daylight-saving settings are adjusted for the chosen local date when their representation is unambiguous.
+
+This alignment is deliberately narrower than a blanket metadata rewrite: UTC reference fields, editing/history/resource timestamps, and unrelated filesystem creation or modification times are not replaced merely because a capture-date conflict was resolved. If the chosen value subsequently receives a timezone/daylight-saving correction, both the selected fields and the rejected conflicting fields converge on the final corrected value. As with DST correction, only classified copies are edited; original source files remain unchanged.
+
 ## Timezone and daylight-saving validation
 
 At startup, the script asks for an IANA timezone used to interpret local capture times. Pressing Enter selects `Europe/Berlin`, which represents Central European Time and Central European Summer Time (`CET`/`CEST`) with the applicable historical transition rules. A different IANA name such as `Europe/London` or `America/New_York` may be entered for files photographed elsewhere.
