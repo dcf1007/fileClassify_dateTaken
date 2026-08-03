@@ -1020,6 +1020,11 @@ def read_related_files_metadata(metadata_reader, primary_stem, related_files):
         # This participates from the start instead of acting as a fallback, so a
         # mismatch with embedded metadata is visible. Only exact-primary-stem
         # image/video files may define consensus through FileModifyDate.
+        #
+        # ExifTool may display FileModifyDate with a UTC offset, but that offset
+        # reflects filesystem/host interpretation rather than camera capture
+        # metadata. FAT-to-NTFS copies are especially prone to such shifts. Keep
+        # only the local wall-clock value and discard the filesystem offset here.
         # --------------------------------------------------------------------
         if is_primary_stem and file_record["is_capture_media"]:
             try:
@@ -1066,7 +1071,7 @@ def read_related_files_metadata(metadata_reader, primary_stem, related_files):
                             "date_type": 0,
                             "datetime": parsed_modify.local_datetime,
                             "source": "File:System:FileModifyDate",
-                            "offset_minutes": parsed_modify.utc_offset_minutes,
+                            "offset_minutes": None,
                             "tag_name": "FileModifyDate",
                             "groups": ["File", "System"],
                             "raw_value": modification_value,
@@ -1099,12 +1104,16 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
     that option's earliest timestamp; comparing only adjacent values would allow
     a chain of small differences to hide a much larger overall disagreement.
 
-    Each option retains all sources and explicit offsets. Its exact representative
-    is the existing timestamp supported by the most distinct sources, then by the
-    most embedded-metadata sources, then the earliest value. One option is accepted
-    silently; multiple options require a user choice. Incomplete components do
-    not participate—ExifTool's complete Composite value represents known combined
-    fields.
+    Each option retains all sources and explicit embedded offsets. Filesystem
+    offsets are discarded: FileModifyDate may contribute its local wall-clock
+    value, but it cannot act as camera timezone/DST evidence, alter remembered
+    correction signatures, or disambiguate a DST fold.
+
+    The exact representative is the existing timestamp supported by the most
+    distinct sources, then by the most embedded-metadata sources, then the earliest
+    value. One option is accepted silently; multiple options require a user choice.
+    Incomplete components do not participate—ExifTool's complete Composite value
+    represents known combined fields.
     """
     candidates_by_file = {}
 
@@ -1163,6 +1172,10 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
     # Counting distinct (file, field) sources avoids allowing duplicate ExifTool
     # extraction instances to inflate support. Embedded metadata wins a support
     # tie against FileModifyDate; the earliest value resolves any remaining tie.
+    #
+    # Only embedded offsets are retained. Even if a future read path accidentally
+    # attaches an offset to a FileModifyDate candidate, this consensus boundary
+    # rejects it so filesystem state cannot enter camera timezone/DST analysis.
     # METADATA still outranks OS_DATE only for the descriptive DATETYPE label.
     # ------------------------------------------------------------------------
     consensus_options = {}
@@ -1208,7 +1221,10 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
 
         for candidate_datetime, source_file, candidate in cluster:
             option["sources"].append((source_file, candidate["source"]))
-            if candidate["offset_minutes"] is not None:
+            if (
+                candidate["kind"] != "file_modify"
+                and candidate["offset_minutes"] is not None
+            ):
                 offset_record = (
                     source_file,
                     candidate["source"],
@@ -1307,10 +1323,12 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
         if rejected_values:
             rejected_datetimes_by_file[source_file] = rejected_values
 
-    # A unique offset attached anywhere in the chosen cluster is retained as the
-    # preferred interpretation of an ambiguous autumn fold and as the absolute
-    # basis for FileModifyDate. Conflicting or absent offsets deliberately leave
-    # the preference unset so timezone-database ambiguity is not hidden.
+    # A unique embedded offset attached anywhere in the chosen cluster is retained
+    # as the preferred interpretation of an ambiguous autumn fold and as the
+    # absolute basis for the FileModifyDate written to copied media. Filesystem
+    # offsets were discarded before this point. Conflicting or absent embedded
+    # offsets deliberately leave the preference unset so timezone-database
+    # ambiguity is not hidden.
     selected_offsets = {
         record[2] for record in selected_option.get("offset_records", [])
     }
