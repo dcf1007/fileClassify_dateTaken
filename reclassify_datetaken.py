@@ -1251,6 +1251,7 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
             "conflict_resolved": False,
             "rejected_datetimes_by_file": {},
             "timezone_correction": None,
+            "preserve_timezone_metadata": False,
             "preferred_utc_offset_minutes": None,
         }
 
@@ -1344,6 +1345,7 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
         "conflict_resolved": conflict_resolved,
         "rejected_datetimes_by_file": rejected_datetimes_by_file,
         "timezone_correction": None,
+        "preserve_timezone_metadata": False,
         "preferred_utc_offset_minutes": preferred_offset,
     }
 
@@ -1370,6 +1372,8 @@ def review_and_correct_timezone_and_dst(
     The selected IANA timezone is an assumption, not proof of a bad camera clock.
     Processing remains silent unless metadata contradicts valid zone states, and
     corrections are offered only when defensible final times can be calculated.
+    If contradictory evidence is kept unchanged, that decision is carried into
+    the write phase so timezone offsets and DST settings are not normalized later.
     """
     selected_datetime = capture_time_consensus["datetime"]
     if selected_datetime is None:
@@ -1624,6 +1628,9 @@ def review_and_correct_timezone_and_dst(
             "  The evidence is contradictory or ambiguous, and no single "
             "defensible correction can be calculated. The selected time is kept."
         )
+        # The absence of a defensible wall-clock correction must not be treated
+        # as permission to rewrite the contradictory timezone/DST metadata later.
+        capture_time_consensus["preserve_timezone_metadata"] = True
         print()
         return
 
@@ -1657,6 +1664,7 @@ def review_and_correct_timezone_and_dst(
         capture_time_consensus["datetime"] = corrected_datetime
         capture_time_consensus["date_type"] = 2
         capture_time_consensus["timezone_correction"] = correction_delta
+        capture_time_consensus["preserve_timezone_metadata"] = False
         return
 
     print("Choose how these files should be classified:")
@@ -1682,6 +1690,10 @@ def review_and_correct_timezone_and_dst(
             continue
 
         if selected_number == 1:
+            # "Keep" applies to both the selected wall clock and the existing
+            # timezone/DST representation. The later metadata writer must not
+            # silently override the user's explicit decision.
+            capture_time_consensus["preserve_timezone_metadata"] = True
             print()
             return
 
@@ -1692,6 +1704,7 @@ def review_and_correct_timezone_and_dst(
             capture_time_consensus["datetime"] = corrected_datetime
             capture_time_consensus["date_type"] = 2
             capture_time_consensus["timezone_correction"] = correction_delta
+            capture_time_consensus["preserve_timezone_metadata"] = False
 
             correction_key = build_automatic_correction_key(
                 correction_delta,
@@ -1872,8 +1885,10 @@ def update_copied_file_metadata_and_system_times(
 
     Timestamp-associated offsets may be updated in media or sidecars. Camera-
     global offsets and active DST/profile values are updated only in primary or
-    derivative image/video files; inactive profiles remain untouched. Ambiguous
-    wall clocks are skipped rather than assigned an arbitrary offset.
+    derivative image/video files; inactive profiles remain untouched. If the user
+    explicitly keeps contradictory timezone/DST evidence, all existing timezone
+    representations are preserved while local capture fields may still follow the
+    selected consensus. Ambiguous wall clocks are never assigned a guessed offset.
 
     Writes are batched, retried individually if one read-only maker field blocks
     the batch, and verified by rereading the copy. FileModifyDate is aligned only
@@ -1887,7 +1902,14 @@ def update_copied_file_metadata_and_system_times(
     skipped = set()
     updated = []
     records = file_record["records"]
+    preserve_timezone_metadata = capture_time_consensus.get(
+        "preserve_timezone_metadata",
+        False,
+    )
 
+    # This offset still determines the absolute FileModifyDate written to copied
+    # media. It is used to normalize embedded timezone metadata only when review
+    # did not explicitly preserve contradictory evidence.
     expected_offset = resolve_filesystem_timestamp_offset(
         selected_datetime,
         classification_timezone,
@@ -1944,7 +1966,11 @@ def update_copied_file_metadata_and_system_times(
             continue
 
         inline_offset = parsed.utc_offset_minutes
-        target_offset = expected_offset if inline_offset is not None else None
+        target_offset = (
+            (inline_offset if preserve_timezone_metadata else expected_offset)
+            if inline_offset is not None
+            else None
+        )
         if inline_offset is not None and target_offset is None:
             skipped.add(f"{metadata_key} (ambiguous consensus UTC offset)")
             continue
@@ -2020,7 +2046,13 @@ def update_copied_file_metadata_and_system_times(
 
         if parsed.local_time is not None:
             target_offset = (
-                expected_offset if parsed.utc_offset_minutes is not None else None
+                (
+                    parsed.utc_offset_minutes
+                    if preserve_timezone_metadata
+                    else expected_offset
+                )
+                if parsed.utc_offset_minutes is not None
+                else None
             )
             if parsed.utc_offset_minutes is not None and target_offset is None:
                 skipped.add(f"{metadata_key} (ambiguous consensus UTC offset)")
@@ -2055,7 +2087,7 @@ def update_copied_file_metadata_and_system_times(
     # media files. Missing offsets are never created, and ambiguity causes a skip
     # instead of a guessed value.
     # ------------------------------------------------------------------------
-    if expected_offset is not None:
+    if expected_offset is not None and not preserve_timezone_metadata:
         # Timestamp-associated offsets may exist in media or sidecars.
         for tag_name in sorted(ASSOCIATED_OFFSET_FIELDS):
             for metadata_key, groups, raw_value in values_by_tag.get(tag_name, []):
@@ -2178,10 +2210,14 @@ def update_copied_file_metadata_and_system_times(
                                 "source": metadata_key,
                             },
                         )
-    else:
+    elif not preserve_timezone_metadata:
         for tag_name in sorted(ASSOCIATED_OFFSET_FIELDS | GLOBAL_OFFSET_TAGS):
             if values_by_tag.get(tag_name):
                 skipped.add(f"{tag_name} (ambiguous consensus UTC offset)")
+
+    # When review explicitly kept contradictory timezone/DST evidence, reaching
+    # this point without offset or DST operations is intentional—not a skipped or
+    # failed correction. FileModifyDate remains handled independently below.
 
     # ------------------------------------------------------------------------
     # EXECUTE EXIFTOOL WRITES, RETRY INDIVIDUALLY, AND VERIFY
