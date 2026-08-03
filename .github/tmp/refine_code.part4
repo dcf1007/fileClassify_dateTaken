@@ -1,0 +1,108 @@
+
+# Override the first cleanup helper with exact indented workflow blocks. The
+# original version used dedent() for code that remains inside a function, which
+# removed the four-space indentation required by the source matcher.
+def apply_small_cleanups(source: str) -> str:
+    """Apply behavior-neutral readability and consistency cleanups."""
+    exact_replacements = {
+        'EXIF_DATE_FORMAT = "%Y:%m:%d %H:%M:%S"\n\n': "",
+        "params=[],\n        )\n    except ExifToolException as error:\n        raise OSError(\n            f\"ExifTool could not read FileModifyDate from '{filename}': \" f\"{error}\"\n": (
+            "params=FILE_MODIFY_DATE_PARAMS,\n"
+            "        )\n"
+            "    except ExifToolException as error:\n"
+            "        raise OSError(\n"
+            "            f\"ExifTool could not read FileModifyDate from "
+            "'{filename}': {error}\"\n"
+        ),
+        "f\"ExifTool could not inspect correction fields in '{filename}': \" f\"{error}\"": (
+            "f\"ExifTool could not inspect correction fields in "
+            "'{filename}': {error}\""
+        ),
+        '"Timezone for timezone/DST checks " f"[{DEFAULT_TIMEZONE_NAME}]: "': (
+            'f"Timezone for timezone/DST checks [{DEFAULT_TIMEZONE_NAME}]: "'
+        ),
+        '"  Selected local time: " f"{selected_datetime.strftime(\'%Y-%m-%d %H:%M:%S\')}"': (
+            'f"  Selected local time: "\n'
+            '            f"{selected_datetime.strftime(\'%Y-%m-%d %H:%M:%S\')}"'
+        ),
+        'print("  1. Keep " f"{selected_datetime.strftime(\'%Y-%m-%d %H:%M:%S\')}")': (
+            'print(\n'
+            '        f"  1. Keep "\n'
+            '        f"{selected_datetime.strftime(\'%Y-%m-%d %H:%M:%S\')}"\n'
+            '    )'
+        ),
+        'print("Selected date: " f"{selected_date_value.strftime(\'%Y-%m-%d %H:%M:%S\')}")': (
+            'print(\n'
+            '            f"Selected date: "\n'
+            '            f"{selected_date_value.strftime(\'%Y-%m-%d %H:%M:%S\')}"\n'
+            '        )'
+        ),
+        'f"Error copying or updating \'{same_stem_file.name}\': " f"{error}"': (
+            'f"Error copying or updating \'{same_stem_file.name}\': "\n'
+            '                f"{error}"'
+        ),
+        'print("Copies with corrected metadata/system time: " f"{stats[\'metadata_updated\']}")': (
+            'print(\n'
+            '        "Copies with corrected metadata/system time: "\n'
+            '        f"{stats[\'metadata_updated\']}"\n'
+            '    )'
+        ),
+        '\n\nif __name__ == "__main__":\n\n    raise SystemExit(main())\n': (
+            '\n\nif __name__ == "__main__":\n'
+            '    raise SystemExit(main())\n'
+        ),
+    }
+
+    for old, new in exact_replacements.items():
+        count = source.count(old)
+        if count != 1:
+            raise SystemExit(
+                f"Expected one cleanup match, found {count}: {old[:80]!r}"
+            )
+        source = source.replace(old, new, 1)
+
+    old_return = (
+        "    return (\n"
+        "        directory,\n"
+        "        timezone_name,\n"
+        "        classification_timezone,\n"
+        "        classified_directory,\n"
+        "        unclassified_directory,\n"
+        "        source_files,\n"
+        "    )"
+    )
+    new_return = (
+        "    return (\n"
+        "        timezone_name,\n"
+        "        classification_timezone,\n"
+        "        classified_directory,\n"
+        "        unclassified_directory,\n"
+        "        source_files,\n"
+        "    )"
+    )
+    if source.count(old_return) != 1:
+        raise SystemExit("prepare_run return block was not found exactly once")
+    source = source.replace(old_return, new_return, 1)
+
+    old_unpack = (
+        "    (\n"
+        "        _directory,\n"
+        "        timezone_name,\n"
+        "        classification_timezone,\n"
+        "        classified_directory,\n"
+        "        unclassified_directory,\n"
+        "        source_files,\n"
+        "    ) = prepare_run()"
+    )
+    new_unpack = (
+        "    (\n"
+        "        timezone_name,\n"
+        "        classification_timezone,\n"
+        "        classified_directory,\n"
+        "        unclassified_directory,\n"
+        "        source_files,\n"
+        "    ) = prepare_run()"
+    )
+    if source.count(old_unpack) != 1:
+        raise SystemExit("main unpack block was not found exactly once")
+    return source.replace(old_unpack, new_unpack, 1)
