@@ -52,6 +52,11 @@ CLASSIFIED_FOLDER_NAME = "classified"
 UNCLASSIFIED_FOLDER_NAME = "unclassified"
 COPY_CHUNK_SIZE = 1024 * 1024
 
+# Candidate timestamps are considered one consensus option when the complete
+# earliest-to-latest span does not exceed this threshold. The value is kept as
+# seconds so the tolerance can be adjusted without changing consensus logic.
+CAPTURE_TIME_CONFLICT_THRESHOLD_SECONDS = 60
+
 # ``Time:All`` discovers standard EXIF, maker-note, XMP, IPTC,
 # QuickTime, and calculated Composite fields without camera make/model
 # dispatch. The extra tags are requested by meaning rather than by brand, so
@@ -1089,37 +1094,119 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
     """
     Merge complete candidates and establish one authoritative capture time.
 
-    Identical values across files/families become one option while preserving
-    every source and explicit offset. One value is accepted silently; multiple
-    values require a user choice. Incomplete components do not participate—
-    ExifTool's complete Composite value represents known combined fields.
+    Candidate values are grouped into threshold-bounded options. Every value in
+    one option must fall within ``CAPTURE_TIME_CONFLICT_THRESHOLD_SECONDS`` of
+    that option's earliest timestamp; comparing only adjacent values would allow
+    a chain of small differences to hide a much larger overall disagreement.
+
+    Each option retains all sources and explicit offsets. Its exact representative
+    is the existing timestamp supported by the most distinct sources, then by the
+    most embedded-metadata sources, then the earliest value. One option is accepted
+    silently; multiple options require a user choice. Incomplete components do
+    not participate—ExifTool's complete Composite value represents known combined
+    fields.
     """
     candidates_by_file = {}
 
     for source_file, file_record in related_files_metadata["files"].items():
         candidates = list(file_record["capture_candidates"])
-
         if candidates:
             candidates_by_file[source_file] = candidates
 
     # ------------------------------------------------------------------------
-    # MERGE IDENTICAL VALUES WITHOUT LOSING SOURCE/OFFSET EVIDENCE
+    # SORT ALL COMPLETE CANDIDATES AND BUILD THRESHOLD-BOUNDED CLUSTERS
     #
-    # METADATA outranks OS_DATE only for the descriptive DATETYPE label.
-    # FileModifyDate remains a real option even when embedded metadata exists.
+    # A new cluster begins only when the candidate is more than the configured
+    # threshold after the current cluster's earliest value. The earliest-to-
+    # latest span therefore remains bounded even when neighboring timestamps are
+    # each close enough to form a misleading chain.
+    # ------------------------------------------------------------------------
+    sorted_candidate_records = sorted(
+        (
+            (candidate["datetime"], source_file, candidate)
+            for source_file, candidates in candidates_by_file.items()
+            for candidate in candidates
+        ),
+        key=lambda record: (
+            record[0],
+            record[1].name.casefold(),
+            str(record[2]["source"]).casefold(),
+        ),
+    )
+
+    consensus_clusters = []
+    current_cluster = []
+    current_cluster_start = None
+
+    for candidate_record in sorted_candidate_records:
+        candidate_datetime = candidate_record[0]
+        if (
+            current_cluster
+            and (candidate_datetime - current_cluster_start).total_seconds()
+            > CAPTURE_TIME_CONFLICT_THRESHOLD_SECONDS
+        ):
+            consensus_clusters.append(current_cluster)
+            current_cluster = []
+            current_cluster_start = None
+
+        if not current_cluster:
+            current_cluster_start = candidate_datetime
+        current_cluster.append(candidate_record)
+
+    if current_cluster:
+        consensus_clusters.append(current_cluster)
+
+    # ------------------------------------------------------------------------
+    # BUILD ONE DISPLAY/DECISION OPTION FOR EACH THRESHOLD CLUSTER
+    #
+    # The representative must be a timestamp that actually exists in metadata.
+    # Counting distinct (file, field) sources avoids allowing duplicate ExifTool
+    # extraction instances to inflate support. Embedded metadata wins a support
+    # tie against FileModifyDate; the earliest value resolves any remaining tie.
+    # METADATA still outranks OS_DATE only for the descriptive DATETYPE label.
     # ------------------------------------------------------------------------
     consensus_options = {}
-    for source_file, candidates in candidates_by_file.items():
-        for candidate in candidates:
-            option = consensus_options.setdefault(
-                candidate["datetime"],
-                {
-                    "date_type": candidate["date_type"],
-                    "sources": [],
-                    "offset_records": [],
-                },
+    for cluster in consensus_clusters:
+        records_by_exact_datetime = {}
+        for candidate_datetime, source_file, candidate in cluster:
+            records_by_exact_datetime.setdefault(candidate_datetime, []).append(
+                (source_file, candidate)
             )
-            option["date_type"] = max(option["date_type"], candidate["date_type"])
+
+        representative_datetime = min(
+            records_by_exact_datetime,
+            key=lambda candidate_datetime: (
+                -len(
+                    {
+                        (source_file, candidate["source"])
+                        for source_file, candidate in records_by_exact_datetime[
+                            candidate_datetime
+                        ]
+                    }
+                ),
+                -len(
+                    {
+                        (source_file, candidate["source"])
+                        for source_file, candidate in records_by_exact_datetime[
+                            candidate_datetime
+                        ]
+                        if candidate["kind"] != "file_modify"
+                    }
+                ),
+                candidate_datetime,
+            ),
+        )
+
+        option = {
+            "date_type": max(record[2]["date_type"] for record in cluster),
+            "sources": [],
+            "offset_records": [],
+            "member_datetimes": set(records_by_exact_datetime),
+            "earliest_datetime": cluster[0][0],
+            "latest_datetime": cluster[-1][0],
+        }
+
+        for candidate_datetime, source_file, candidate in cluster:
             option["sources"].append((source_file, candidate["source"]))
             if candidate["offset_minutes"] is not None:
                 offset_record = (
@@ -1130,8 +1217,10 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
                 if offset_record not in option["offset_records"]:
                     option["offset_records"].append(offset_record)
 
-    # No complete candidate means review. The script never invents a
-    # timestamp from an incomplete component or an unrelated system field.
+        consensus_options[representative_datetime] = option
+
+    # No complete candidate means review. The script never invents a timestamp
+    # from an incomplete component or an unrelated system field.
     if not consensus_options:
         for source_file in related_files_metadata["usable_files"]:
             related_files_metadata["review_reasons"].setdefault(
@@ -1150,7 +1239,7 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
         }
 
     # ------------------------------------------------------------------------
-    # ACCEPT ONE VALUE OR ASK THE USER TO RESOLVE CONFLICTING VALUES
+    # ACCEPT ONE THRESHOLD CLUSTER OR ASK THE USER TO RESOLVE MULTIPLE CLUSTERS
     # ------------------------------------------------------------------------
     conflict_resolved = len(consensus_options) > 1
     if not conflict_resolved:
@@ -1166,10 +1255,21 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
             sorted_options,
             start=1,
         ):
+            cluster_span_seconds = int(
+                (
+                    option["latest_datetime"] - option["earliest_datetime"]
+                ).total_seconds()
+            )
+            tolerance_label = (
+                ""
+                if cluster_span_seconds == 0
+                else f"; source span {cluster_span_seconds}s"
+            )
             print(
                 f"  {option_number}. "
                 f"{candidate_datetime.strftime('%Y-%m-%d %H:%M:%S')} - "
                 f"{format_labels_by_file(option['sources'])}"
+                f"{tolerance_label}"
             )
 
         while True:
@@ -1191,23 +1291,25 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
                 break
             print("Invalid selection. Enter one of the listed numbers.")
 
-    # Rejected embedded/Composite values are recorded per source file.
-    # FileModifyDate is excluded because it is corrected as a filesystem value,
-    # not as an embedded ExifTool target.
+    # Rejected embedded/Composite values are those outside the selected threshold
+    # cluster. Different seconds inside the selected cluster are supporting
+    # evidence, not a conflict. FileModifyDate is excluded because it is corrected
+    # as a filesystem value rather than as an embedded ExifTool target.
+    selected_member_datetimes = selected_option["member_datetimes"]
     rejected_datetimes_by_file = {}
     for source_file, candidates in candidates_by_file.items():
         rejected_values = {
             candidate["datetime"]
             for candidate in candidates
             if candidate["kind"] != "file_modify"
-            and candidate["datetime"] != selected_datetime
+            and candidate["datetime"] not in selected_member_datetimes
         }
         if rejected_values:
             rejected_datetimes_by_file[source_file] = rejected_values
 
-    # A unique offset attached to the chosen value is retained as the preferred
-    # interpretation of an ambiguous autumn fold and as the absolute basis for
-    # FileModifyDate. Conflicting or absent attached offsets deliberately leave
+    # A unique offset attached anywhere in the chosen cluster is retained as the
+    # preferred interpretation of an ambiguous autumn fold and as the absolute
+    # basis for FileModifyDate. Conflicting or absent offsets deliberately leave
     # the preference unset so timezone-database ambiguity is not hidden.
     selected_offsets = {
         record[2] for record in selected_option.get("offset_records", [])
