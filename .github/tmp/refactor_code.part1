@@ -1,0 +1,260 @@
+from __future__ import annotations
+
+import ast
+import textwrap
+from pathlib import Path
+
+
+SOURCE_PATH = Path("reclassify_datetaken.py")
+README_PATH = Path("README.md")
+
+ORIGINAL_FUNCTIONS = {
+    "clean_input_path",
+    "split_metadata_key",
+    "iter_metadata_values",
+    "get_metadata_values",
+    "get_first_metadata_value",
+    "is_image_file",
+    "is_capture_media_file",
+    "parse_timezone_offset_minutes",
+    "parse_context_offset",
+    "parse_complete_metadata_datetime",
+    "parse_daylight_savings_value",
+    "parse_world_time_location",
+    "request_classification_timezone",
+    "timezone_states_for_local_time",
+    "daylight_saving_delta_for_year",
+    "derive_offset_from_utc",
+    "format_utc_offset",
+    "format_exif_offset",
+    "get_unambiguous_timezone_state",
+    "get_unambiguous_timezone_offset",
+    "resolve_system_timestamp_offset",
+    "system_datetime_to_epoch_ns",
+    "get_metadata_write_target",
+    "format_complete_datetime",
+    "format_date_only",
+    "format_time_only",
+    "parse_partial_datetime",
+    "normalize_target",
+    "read_correction_metadata",
+    "add_correction_operation",
+    "format_context_offset_value",
+    "raw_dst_write_value",
+    "operation_matches",
+    "build_correction_operations",
+    "execute_correction_operations",
+    "update_corrected_copy_metadata",
+    "format_records_by_file",
+    "resolve_camera_configuration",
+    "collect_timezone_evidence",
+    "build_automatic_correction_key",
+    "review_timezone_evidence",
+    "get_dates",
+    "get_file_modify_date",
+    "format_date_sources",
+    "stems_are_related",
+    "group_related_files",
+    "files_are_binary_identical",
+    "copy_file_safely",
+    "find_previous_corrected_duplicate",
+    "copy_file_with_corrected_metadata",
+}
+
+
+def section(title: str, description: str) -> str:
+    """Return one visible responsibility banner for the generated module."""
+    wrapped = textwrap.wrap(description, width=76)
+    description_lines = "\n".join(f"# {line}" for line in wrapped)
+    return (
+        "# " + "=" * 76 + "\n"
+        f"# {title}\n"
+        "# " + "=" * 76 + "\n"
+        f"{description_lines}\n"
+    )
+
+
+def extract_functions(source: str) -> tuple[str, dict[str, str]]:
+    """Return the non-function preamble and exact text of each top-level function."""
+    tree = ast.parse(source)
+    lines = source.splitlines(keepends=True)
+    function_nodes = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    if not function_nodes:
+        raise SystemExit("No top-level functions were found")
+
+    function_text = {
+        node.name: "".join(lines[node.lineno - 1 : node.end_lineno]).rstrip()
+        for node in function_nodes
+    }
+    if set(function_text) != ORIGINAL_FUNCTIONS:
+        missing = sorted(ORIGINAL_FUNCTIONS - set(function_text))
+        unexpected = sorted(set(function_text) - ORIGINAL_FUNCTIONS)
+        raise SystemExit(
+            "Function inventory changed before refactoring; "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+
+    first_function_line = min(node.lineno for node in function_nodes)
+    preamble = "".join(lines[: first_function_line - 1]).rstrip()
+    return preamble, function_text
+
+
+def split_imports_and_constants(preamble: str) -> tuple[str, str]:
+    """Separate imports from the module's constants and metadata policy."""
+    marker = "\n\nDATETYPE ="
+    imports, separator, constants = preamble.partition(marker)
+    if not separator:
+        raise SystemExit("Could not locate the DATETYPE constants boundary")
+    return imports.rstrip(), ("DATETYPE =" + constants).rstrip()
+
+
+NEW_WORKFLOW_FUNCTIONS = textwrap.dedent(
+    r'''
+    def prepare_run():
+        """
+        Validate user input, create output directories, and list source files.
+
+        Only regular, non-symlink files directly inside the selected directory
+        are returned. Subdirectories are deliberately not traversed.
+        """
+        directory = clean_input_path(
+            input("Please write (or drag) the source directory path: ")
+        )
+        if not directory.exists() or not directory.is_dir():
+            print(f"Error: source directory is invalid: '{directory}'")
+            input("Press Enter to exit")
+            raise SystemExit(1)
+
+        directory = directory.resolve()
+        timezone_name, classification_timezone = request_classification_timezone()
+
+        classified_directory = directory / CLASSIFIED_FOLDER_NAME
+        unclassified_directory = directory / UNCLASSIFIED_FOLDER_NAME
+
+        for output_directory in (classified_directory, unclassified_directory):
+            if output_directory.exists() and not output_directory.is_dir():
+                print(
+                    f"Error: '{output_directory}' already exists as a file. "
+                    "It must be a directory."
+                )
+                input("Press Enter to exit")
+                raise SystemExit(1)
+
+        try:
+            classified_directory.mkdir(exist_ok=True)
+            unclassified_directory.mkdir(exist_ok=True)
+            source_files = sorted(
+                (
+                    filename
+                    for filename in directory.iterdir()
+                    if filename.is_file() and not filename.is_symlink()
+                ),
+                key=lambda filename: filename.name.casefold(),
+            )
+        except OSError as error:
+            print(f"Error preparing directories: {error}")
+            input("Press Enter to exit")
+            raise SystemExit(1)
+
+        return (
+            directory,
+            timezone_name,
+            classification_timezone,
+            classified_directory,
+            unclassified_directory,
+            source_files,
+        )
+
+
+    def start_metadata_reader():
+        """Start one persistent ExifTool process for the complete run."""
+        try:
+            metadata_reader = ExifToolHelper(common_args=["-G0:1:4"])
+            metadata_reader.run()
+            return metadata_reader
+        except (FileNotFoundError, OSError, ValueError, ExifToolException) as error:
+            print(
+                "Error: PyExifTool could not start the ExifTool executable. "
+                "Install ExifTool and make sure it is available on PATH. "
+                f"Details: {error}"
+            )
+            input("Press Enter to exit")
+            raise SystemExit(1)
+
+
+    def create_run_stats():
+        """Return counters used for the final execution summary."""
+        return {
+            "copied": 0,
+            "duplicates": 0,
+            "renamed": 0,
+            "review": 0,
+            "failed": 0,
+            "metadata_updated": 0,
+            "metadata_skipped": 0,
+        }
+
+
+    def scan_related_group(metadata_reader, base_stem, same_stem_files):
+        """
+        Read all files in one related group and collect classification evidence.
+
+        Embedded metadata is considered first. FileModifyDate fallback is added
+        only when the complete group has no usable embedded timestamp, and only
+        exact-base image files may supply that fallback.
+        """
+        scan = {
+            "file_dates": {},
+            "usable_files": set(),
+            "base_image_files": [],
+            "base_capture_files": [],
+            "context_records_by_file": {},
+            "utc_records_by_file": {},
+            "review_reasons": {},
+            "failures": 0,
+        }
+
+        for same_stem_file in same_stem_files:
+            try:
+                (
+                    date_candidates,
+                    review_reason,
+                    file_is_image,
+                    context_records,
+                    utc_records,
+                    file_is_capture_media,
+                ) = get_dates(metadata_reader, same_stem_file)
+            except OSError as error:
+                print(
+                    f"Error reading '{same_stem_file.name}': {error}",
+                    file=sys.stderr,
+                )
+                scan["failures"] += 1
+                continue
+
+            if review_reason is not None:
+                print(
+                    f"Warning: '{same_stem_file.name}' requires review: "
+                    f"{review_reason}",
+                    file=sys.stderr,
+                )
+                scan["review_reasons"][same_stem_file] = review_reason
+                continue
+
+            scan["usable_files"].add(same_stem_file)
+            if context_records:
+                scan["context_records_by_file"][same_stem_file] = context_records
+            if utc_records:
+                scan["utc_records_by_file"][same_stem_file] = utc_records
+            if date_candidates:
+                scan["file_dates"][same_stem_file] = date_candidates
+
+            if same_stem_file.stem.casefold() == base_stem.casefold():
+                if file_is_image:
+                    scan["base_image_files"].append(same_stem_file)
+                if file_is_capture_media:
+                    scan["base_capture_files"].append(same_stem_file)
