@@ -2397,64 +2397,8 @@ def copy_file_with_corrected_metadata(
 # ============================================================================
 # CLASSIFICATION WORKFLOW AND COMMAND-LINE ENTRY POINT
 # ============================================================================
-# The functions below make the execution path explicit: prepare the run, scan
-# one related group, resolve its decisions, copy it, report results, and
-# terminate ExifTool in a finally block.
-
-
-def prepare_run():
-    """
-    Validate user input, create output directories, and list source files.
-
-    Only regular, non-symlink files directly inside the selected directory
-    are returned. Subdirectories are deliberately not traversed.
-    """
-    directory = clean_input_path(
-        input("Please write (or drag) the source directory path: ")
-    )
-    if not directory.exists() or not directory.is_dir():
-        print(f"Error: source directory is invalid: '{directory}'")
-        input("Press Enter to exit")
-        raise SystemExit(1)
-
-    directory = directory.resolve()
-    timezone_name, classification_timezone = request_classification_timezone()
-
-    classified_directory = directory / CLASSIFIED_FOLDER_NAME
-    unclassified_directory = directory / UNCLASSIFIED_FOLDER_NAME
-
-    for output_directory in (classified_directory, unclassified_directory):
-        if output_directory.exists() and not output_directory.is_dir():
-            print(
-                f"Error: '{output_directory}' already exists as a file. "
-                "It must be a directory."
-            )
-            input("Press Enter to exit")
-            raise SystemExit(1)
-
-    try:
-        classified_directory.mkdir(exist_ok=True)
-        unclassified_directory.mkdir(exist_ok=True)
-        source_files = sorted(
-            (
-                filename
-                for filename in directory.iterdir()
-                if filename.is_file() and not filename.is_symlink()
-            ),
-            key=lambda filename: filename.name.casefold(),
-        )
-    except OSError as error:
-        print(f"Error preparing directories: {error}")
-        input("Press Enter to exit")
-        raise SystemExit(1)
-
-    return (
-        timezone_name,
-        classification_timezone,
-        classified_directory,
-        unclassified_directory,
-        source_files,
-    )
+# Main exposes the complete startup sequence. Focused helpers below handle
+# metadata processing, per-group decisions, copying, and final reporting.
 
 
 def start_metadata_reader():
@@ -2895,14 +2839,45 @@ def run_classification(
 
 
 def main():
-    """Run the interactive classifier and return its process exit code."""
-    (
-        timezone_name,
-        classification_timezone,
-        classified_directory,
-        unclassified_directory,
-        source_files,
-    ) = prepare_run()
+    """Validate startup configuration and run the interactive classifier."""
+    source_directory = clean_input_path(
+        input("Please write (or drag) the source directory path: ")
+    )
+    if not source_directory.exists() or not source_directory.is_dir():
+        print(f"Error: source directory is invalid: '{source_directory}'")
+        input("Press Enter to exit")
+        return 1
+
+    source_directory = source_directory.resolve()
+    timezone_name, classification_timezone = request_classification_timezone()
+
+    classified_directory = source_directory / CLASSIFIED_FOLDER_NAME
+    unclassified_directory = source_directory / UNCLASSIFIED_FOLDER_NAME
+    for output_directory in (classified_directory, unclassified_directory):
+        if output_directory.exists() and not output_directory.is_dir():
+            print(
+                f"Error: '{output_directory}' already exists as a file. "
+                "It must be a directory."
+            )
+            input("Press Enter to exit")
+            return 1
+
+    try:
+        classified_directory.mkdir(exist_ok=True)
+        unclassified_directory.mkdir(exist_ok=True)
+        source_files = sorted(
+            (
+                filename
+                for filename in source_directory.iterdir()
+                if filename.is_file() and not filename.is_symlink()
+            ),
+            key=lambda filename: filename.name.casefold(),
+        )
+    except OSError as error:
+        print(f"Error preparing directories: {error}")
+        input("Press Enter to exit")
+        return 1
+
     return run_classification(
         source_files,
         timezone_name,
