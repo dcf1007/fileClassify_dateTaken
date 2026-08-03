@@ -1,0 +1,313 @@
+from __future__ import annotations
+
+import ast
+import textwrap
+from pathlib import Path
+
+
+SOURCE_PATH = Path("reclassify_datetaken.py")
+
+
+def replace_function(source: str, function_name: str, replacement: str) -> str:
+    """Replace one top-level function by its exact source range."""
+    tree = ast.parse(source)
+    node = next(
+        (
+            item
+            for item in tree.body
+            if isinstance(item, ast.FunctionDef) and item.name == function_name
+        ),
+        None,
+    )
+    if node is None:
+        raise SystemExit(f"Could not find function {function_name!r}")
+
+    lines = source.splitlines(keepends=True)
+    start = sum(len(line) for line in lines[: node.lineno - 1])
+    end = sum(len(line) for line in lines[: node.end_lineno])
+    return source[:start] + replacement.rstrip() + "\n\n" + source[end:].lstrip("\n")
+
+
+NEW_CORRECTION_PLANNER = textwrap.dedent(
+    r'''
+    def index_correction_metadata(records):
+        """
+        Index metadata once for the correction-planning helpers.
+
+        ``records_by_family_tag`` keeps duplicate values scoped to their ExifTool
+        family path. ``values_by_tag`` supports context fields whose semantics do
+        not depend on one specific storage family.
+        """
+        records_by_family_tag = {}
+        values_by_tag = {}
+        for metadata_key, groups, tag_name, raw_value in records:
+            family_key = tuple(
+                group_name
+                for group_name in groups
+                if not group_name.casefold().startswith("copy")
+            )
+            records_by_family_tag.setdefault((family_key, tag_name), []).append(
+                (metadata_key, groups, raw_value)
+            )
+            values_by_tag.setdefault(tag_name, []).append(
+                (metadata_key, groups, raw_value)
+            )
+        return records_by_family_tag, values_by_tag
+
+
+    def plan_complete_timestamp_corrections(
+        records,
+        records_by_family_tag,
+        timezone_correction_active,
+        effective_correction_delta,
+        selected_corrected_datetime,
+        classification_timezone,
+        conflicting_date_values,
+        operations,
+        skipped,
+    ):
+        """
+        Plan writes for complete local timestamps and inline offsets.
+
+        Rejected conflict values are replaced by the selected date. Other local
+        timestamps are shifted only for an approved timezone correction. Values
+        with a separate OffsetTime* field are left unchanged here so the offset
+        planner can update the paired offset without shifting the wall clock.
+        """
+        offset_presence = {
+            (family_key[0] if family_key else "", tag_name)
+            for (family_key, tag_name), tag_records in records_by_family_tag.items()
+            if tag_records and tag_name in set(ASSOCIATED_OFFSET_TAGS.values())
+        }
+        corrected_local_values = {}
+
+        for metadata_key, groups, tag_name, raw_value in records:
+            if (
+                tag_name in TIME_CONTEXT_TAGS
+                or tag_name in UTC_REFERENCE_TAGS
+                or tag_name in NONLOCAL_CORRECTION_TAGS
+                or tag_name
+                in {"FileCreateDate", "FileModifyDate", "FileAccessDate"}
+                or not groups
+                or groups[0] == "Composite"
+            ):
+                continue
+
+            try:
+                parsed = parse_complete_metadata_datetime(raw_value)
+            except ValueError:
+                skipped.add(f"{metadata_key} (invalid timestamp)")
+                continue
+            if parsed is None:
+                continue
+
+            local_datetime, inline_offset = parsed
+            family_zero = groups[0]
+            associated_offset_tag = ASSOCIATED_OFFSET_TAGS.get(tag_name)
+            has_separate_offset = (
+                associated_offset_tag is not None
+                and (family_zero, associated_offset_tag) in offset_presence
+            )
+            write_target = get_metadata_write_target(groups, tag_name)
+            if write_target is None:
+                continue
+
+            align_to_selected = (
+                local_datetime in conflicting_date_values
+                and tag_name not in EXCLUDED_TIME_TAGS
+            )
+            if not timezone_correction_active and not align_to_selected:
+                continue
+
+            if align_to_selected:
+                expected_local = selected_corrected_datetime
+                if inline_offset is not None:
+                    expected_offset = get_unambiguous_timezone_offset(
+                        expected_local,
+                        classification_timezone,
+                    )
+                    if expected_offset is None:
+                        skipped.add(
+                            f"{metadata_key} (ambiguous selected-date offset)"
+                        )
+                        continue
+                    expected_text = format_complete_datetime(
+                        raw_value,
+                        expected_local,
+                        expected_offset,
+                    )
+                    expected = (expected_local, expected_offset)
+                else:
+                    expected_text = format_complete_datetime(
+                        raw_value,
+                        expected_local,
+                    )
+                    expected = (expected_local, None)
+            elif inline_offset is not None:
+                expected_offset = get_unambiguous_timezone_offset(
+                    local_datetime,
+                    classification_timezone,
+                )
+                if expected_offset is None:
+                    skipped.add(f"{metadata_key} (ambiguous corrected offset)")
+                    continue
+                expected_local = local_datetime
+                expected_text = format_complete_datetime(
+                    raw_value,
+                    expected_local,
+                    expected_offset,
+                )
+                expected = (expected_local, expected_offset)
+            elif has_separate_offset:
+                expected_local = local_datetime
+                corrected_local_values.setdefault(
+                    (family_zero, tag_name),
+                    [],
+                ).append(expected_local)
+                continue
+            else:
+                expected_local = local_datetime + effective_correction_delta
+                expected_text = format_complete_datetime(
+                    raw_value,
+                    expected_local,
+                )
+                expected = (expected_local, None)
+
+            corrected_local_values.setdefault(
+                (family_zero, tag_name),
+                [],
+            ).append(expected_local)
+            add_correction_operation(
+                operations,
+                skipped,
+                {
+                    "target": write_target,
+                    "value": expected_text,
+                    "kind": "datetime",
+                    "expected": expected,
+                    "tag_name": tag_name,
+                    "source": metadata_key,
+                },
+            )
+
+        return corrected_local_values
+
+
+    def plan_partial_timestamp_corrections(
+        records_by_family_tag,
+        timezone_correction_active,
+        effective_correction_delta,
+        selected_corrected_datetime,
+        classification_timezone,
+        conflicting_date_values,
+        operations,
+        skipped,
+    ):
+        """Plan paired IPTC-style date and time writes, including day rollover."""
+        for date_tag, time_tag in PARTIAL_DATE_TIME_PAIRS:
+            family_keys = {
+                family_key
+                for family_key, tag_name in records_by_family_tag
+                if tag_name in {date_tag, time_tag}
+            }
+            for family_key in family_keys:
+                date_records = records_by_family_tag.get(
+                    (family_key, date_tag),
+                    [],
+                )
+                time_records = records_by_family_tag.get(
+                    (family_key, time_tag),
+                    [],
+                )
+                if len(date_records) != 1 or len(time_records) != 1:
+                    continue
+
+                date_key, date_groups, date_value = date_records[0]
+                time_key, time_groups, time_value = time_records[0]
+                try:
+                    parsed_pair = parse_partial_datetime(date_value, time_value)
+                except ValueError:
+                    parsed_pair = None
+                if parsed_pair is None:
+                    continue
+
+                local_datetime, inline_offset = parsed_pair
+                align_to_selected = local_datetime in conflicting_date_values
+                if not timezone_correction_active and not align_to_selected:
+                    continue
+
+                if align_to_selected:
+                    expected_local = selected_corrected_datetime
+                    if inline_offset is None:
+                        expected_offset = None
+                    else:
+                        expected_offset = get_unambiguous_timezone_offset(
+                            expected_local,
+                            classification_timezone,
+                        )
+                        if expected_offset is None:
+                            skipped.add(
+                                f"{time_key} (ambiguous selected-date offset)"
+                            )
+                            continue
+                elif inline_offset is None:
+                    expected_local = local_datetime + effective_correction_delta
+                    expected_offset = None
+                else:
+                    expected_local = local_datetime
+                    expected_offset = get_unambiguous_timezone_offset(
+                        local_datetime,
+                        classification_timezone,
+                    )
+                    if expected_offset is None:
+                        skipped.add(
+                            f"{time_key} (ambiguous corrected offset)"
+                        )
+                        continue
+
+                date_target = get_metadata_write_target(date_groups, date_tag)
+                time_target = get_metadata_write_target(time_groups, time_tag)
+                if date_target is not None:
+                    add_correction_operation(
+                        operations,
+                        skipped,
+                        {
+                            "target": date_target,
+                            "value": format_date_only(
+                                date_value,
+                                expected_local,
+                            ),
+                            "kind": "date",
+                            "expected": (
+                                expected_local.year,
+                                expected_local.month,
+                                expected_local.day,
+                            ),
+                            "tag_name": date_tag,
+                            "source": date_key,
+                        },
+                    )
+                if time_target is not None:
+                    add_correction_operation(
+                        operations,
+                        skipped,
+                        {
+                            "target": time_target,
+                            "value": format_time_only(
+                                time_value,
+                                expected_local,
+                                expected_offset,
+                            ),
+                            "kind": "time",
+                            "expected": (
+                                expected_local.hour,
+                                expected_local.minute,
+                                expected_local.second,
+                                expected_offset,
+                            ),
+                            "tag_name": time_tag,
+                            "source": time_key,
+                        },
+                    )
+    '''
+).strip()
