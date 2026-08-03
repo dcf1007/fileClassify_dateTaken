@@ -1,0 +1,260 @@
+                )
+                stats["failed"] += 1
+                continue
+
+            updated_metadata_targets = []
+            skipped_metadata_targets = []
+            conflicting_date_values = conflicting_date_values_by_file.get(
+                same_stem_file,
+                set(),
+            )
+            align_system_times = (
+                date_conflict_resolved
+                or timezone_correction_delta is not None
+            ) and same_stem_file not in review_reasons
+            corrected_copy = (
+                (align_system_times or bool(conflicting_date_values))
+                and same_stem_file not in review_reasons
+            )
+            already_corrected = False
+
+            try:
+                destination_directory.mkdir(parents=True, exist_ok=True)
+                requested_destination = (
+                    destination_directory / same_stem_file.name
+                )
+                if corrected_copy:
+                    (
+                        destination_file,
+                        copied,
+                        renamed,
+                        updated_metadata_targets,
+                        skipped_metadata_targets,
+                        already_corrected,
+                    ) = copy_file_with_corrected_metadata(
+                        metadata_reader,
+                        same_stem_file,
+                        requested_destination,
+                        timezone_correction_delta,
+                        selected_file_date[1],
+                        classification_timezone,
+                        conflicting_date_values,
+                        align_system_times,
+                        preferred_system_offset_minutes,
+                    )
+                else:
+                    destination_file, copied, renamed = copy_file_safely(
+                        same_stem_file,
+                        requested_destination,
+                    )
+            except OSError as error:
+                print(
+                    f"Error copying or updating '{same_stem_file.name}': "
+                    f"{error}",
+                    file=sys.stderr,
+                )
+                stats["failed"] += 1
+                continue
+
+            print(
+                f"{same_stem_file.name}\t--->\t{folder_name}\t",
+                end="",
+            )
+            if copied:
+                stats["copied"] += 1
+                if renamed:
+                    stats["renamed"] += 1
+                    print(f"COPIED AS {destination_file.name}", end="")
+                else:
+                    print("COPIED", end="")
+            else:
+                stats["duplicates"] += 1
+                print(f"DUPLICATE OF {destination_file.name}", end="")
+
+            if corrected_copy:
+                if copied:
+                    stats["metadata_updated"] += 1
+                if skipped_metadata_targets:
+                    stats["metadata_skipped"] += 1
+                if already_corrected:
+                    print("; METADATA ALREADY CORRECTED", end="")
+                elif updated_metadata_targets:
+                    print(
+                        "; METADATA UPDATED: "
+                        + ", ".join(updated_metadata_targets),
+                        end="",
+                    )
+                if skipped_metadata_targets:
+                    print(
+                        "; NOT WRITABLE/SKIPPED: "
+                        + ", ".join(skipped_metadata_targets),
+                        end="",
+                    )
+
+            if same_stem_file in review_reasons:
+                stats["review"] += 1
+                print(
+                    f"; REVIEW: {review_reasons[same_stem_file]}",
+                    end="",
+                )
+            else:
+                print(
+                    f"; {selected_file_date[1].strftime('%Y-%m-%d %H:%M:%S')} "
+                    f"{DATETYPE[selected_file_date[0]]}",
+                    end="",
+                )
+            print()
+
+
+    def process_related_group(
+        metadata_reader,
+        base_stem,
+        same_stem_files,
+        timezone_name,
+        classification_timezone,
+        automatic_correction_rules,
+        classified_directory,
+        unclassified_directory,
+        stats,
+    ):
+        """Run the complete read, decision, DST review, and copy flow for a group."""
+        scan = scan_related_group(
+            metadata_reader,
+            base_stem,
+            same_stem_files,
+        )
+        stats["failed"] += scan["failures"]
+
+        date_options = build_date_options(scan["file_dates"])
+        (
+            selected_file_date,
+            selected_date_option,
+            date_conflict_resolved,
+            conflicting_date_values_by_file,
+        ) = choose_group_date(
+            date_options,
+            same_stem_files,
+            scan["file_dates"],
+        )
+
+        (
+            selected_file_date,
+            timezone_correction_delta,
+            preferred_system_offset_minutes,
+        ) = review_group_timezone(
+            selected_file_date,
+            selected_date_option,
+            scan,
+            timezone_name,
+            classification_timezone,
+            automatic_correction_rules,
+        )
+
+        copy_group_files(
+            metadata_reader,
+            same_stem_files,
+            scan,
+            selected_file_date,
+            date_conflict_resolved,
+            conflicting_date_values_by_file,
+            timezone_correction_delta,
+            preferred_system_offset_minutes,
+            classification_timezone,
+            classified_directory,
+            unclassified_directory,
+            stats,
+        )
+
+
+    def print_run_summary(
+        classified_directory,
+        unclassified_directory,
+        stats,
+    ):
+        """Print the final destination paths and all processing counters."""
+        print()
+        print(f"Classified directory: {classified_directory}")
+        print(f"Unclassified directory: {unclassified_directory}")
+        print(f"Copied files: {stats['copied']}")
+        print(f"Binary duplicates: {stats['duplicates']}")
+        print(f"Renamed collision copies: {stats['renamed']}")
+        print(f"Files sent for review: {stats['review']}")
+        print(f"Failed files: {stats['failed']}")
+        print(
+            "Copies with corrected metadata/system time: "
+            f"{stats['metadata_updated']}"
+        )
+        print(
+            "Corrected copies with skipped read-only fields: "
+            f"{stats['metadata_skipped']}"
+        )
+        print("Original source files were not modified.")
+
+
+    def run_classification(
+        source_files,
+        timezone_name,
+        classification_timezone,
+        classified_directory,
+        unclassified_directory,
+    ):
+        """Process all related groups through one persistent ExifTool session."""
+        same_stem_groups = group_related_files(source_files)
+        metadata_reader = start_metadata_reader()
+        stats = create_run_stats()
+        automatic_correction_rules = set()
+
+        try:
+            for base_stem, same_stem_files in same_stem_groups:
+                process_related_group(
+                    metadata_reader,
+                    base_stem,
+                    same_stem_files,
+                    timezone_name,
+                    classification_timezone,
+                    automatic_correction_rules,
+                    classified_directory,
+                    unclassified_directory,
+                    stats,
+                )
+        finally:
+            metadata_reader.terminate()
+
+        print_run_summary(
+            classified_directory,
+            unclassified_directory,
+            stats,
+        )
+        input("Press Enter to exit")
+        return 2 if stats["failed"] else 0
+
+
+    def main():
+        """Run the interactive classifier and return its process exit code."""
+        (
+            _directory,
+            timezone_name,
+            classification_timezone,
+            classified_directory,
+            unclassified_directory,
+            source_files,
+        ) = prepare_run()
+        return run_classification(
+            source_files,
+            timezone_name,
+            classification_timezone,
+            classified_directory,
+            unclassified_directory,
+        )
+    '''
+).strip()
+
+
+def update_readme() -> None:
+    """Document the responsibility-based organization without changing usage."""
+    readme = README_PATH.read_text(encoding="utf-8")
+    heading = "## Code organization"
+    if heading in readme:
+        return
+
+    section_text = textwrap.dedent(
