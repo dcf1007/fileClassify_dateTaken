@@ -447,7 +447,7 @@ def format_complete_datetime(original_value, local_datetime, offset_minutes=None
     fraction = date_match.group("fraction")
     timezone_text = date_match.group("timezone")
     if offset_minutes is not None:
-        timezone_text = format_exif_offset(offset_minutes)
+        timezone_text = format_offset(offset_minutes)
 
     formatted = (
         f"{local_datetime.year:04d}{date_separator}"
@@ -492,7 +492,7 @@ def format_time_only(original_value, local_datetime, offset_minutes=None):
         formatted += f".{fraction}"
     timezone_text = time_match.group("timezone")
     if offset_minutes is not None:
-        timezone_text = format_exif_offset(offset_minutes)
+        timezone_text = format_offset(offset_minutes)
     if timezone_text is not None:
         formatted += timezone_text
     return formatted
@@ -777,23 +777,15 @@ def derive_offset_from_utc(local_datetime, utc_datetime):
     return None
 
 
-def format_utc_offset(offset_minutes):
-    """Format an offset in minutes as UTC+HH:MM or UTC-HH:MM."""
-    sign = "+" if offset_minutes >= 0 else "-"
-    absolute_minutes = abs(offset_minutes)
-    hours, minutes = divmod(absolute_minutes, 60)
-    return f"UTC{sign}{hours:02d}:{minutes:02d}"
-
-
-def format_exif_offset(offset_minutes):
-    """Format an offset in minutes for EXIF/XMP offset values."""
+def format_offset(offset_minutes):
+    """Format an offset in minutes as +HH:MM or -HH:MM."""
     sign = "+" if offset_minutes >= 0 else "-"
     absolute_minutes = abs(offset_minutes)
     hours, minutes = divmod(absolute_minutes, 60)
     return f"{sign}{hours:02d}:{minutes:02d}"
 
 
-def get_unambiguous_timezone_state(local_datetime, classification_timezone):
+def resolve_unambiguous_timezone_state(local_datetime, classification_timezone):
     """Return the sole valid (DST, offset, abbreviation) state, or None."""
     states = timezone_states_for_local_time(
         local_datetime,
@@ -802,9 +794,9 @@ def get_unambiguous_timezone_state(local_datetime, classification_timezone):
     return states[0] if len(states) == 1 else None
 
 
-def get_unambiguous_timezone_offset(local_datetime, classification_timezone):
+def resolve_unambiguous_timezone_offset(local_datetime, classification_timezone):
     """Return the sole valid UTC offset for a local time, or None."""
-    state = get_unambiguous_timezone_state(
+    state = resolve_unambiguous_timezone_state(
         local_datetime,
         classification_timezone,
     )
@@ -952,7 +944,7 @@ def collect_timezone_evidence(
             (
                 filename,
                 source_name,
-                format_utc_offset(offset_minutes),
+                "UTC" + format_offset(offset_minutes),
                 offset_minutes,
                 "timestamp offset",
             )
@@ -1068,7 +1060,7 @@ def review_timezone_evidence(
     if valid_states:
         expected_text = ", ".join(
             f"{abbreviation or timezone_name} "
-            f"{format_utc_offset(offset_minutes)}, "
+            f"UTC{format_offset(offset_minutes)}, "
             f"DST {'ON' if dst_state else 'OFF'}"
             for dst_state, offset_minutes, abbreviation in valid_states
         )
@@ -1101,7 +1093,7 @@ def review_timezone_evidence(
                     (
                         filename,
                         f"{source_name}={raw_value} -> "
-                        f"{format_utc_offset(offset_minutes)} "
+                        f"UTC{format_offset(offset_minutes)} "
                         f"[{evidence_kind}]",
                     )
                     for (
@@ -1136,8 +1128,8 @@ def review_timezone_evidence(
                 correction_delta = timedelta(minutes=expected_offset - observed_offset)
                 corrected_datetime = selected_datetime + correction_delta
                 correction_reasons.setdefault(corrected_datetime, []).append(
-                    f"convert {format_utc_offset(observed_offset)} evidence "
-                    f"to {format_utc_offset(expected_offset)}"
+                    f"convert UTC{format_offset(observed_offset)} evidence "
+                    f"to UTC{format_offset(expected_offset)}"
                 )
 
         # A stale DST flag may exist without an explicit/derived offset. In that
@@ -1315,7 +1307,7 @@ def format_context_offset_value(tag_name, original_value, offset_minutes):
         )
 
     original_text = str(original_value).strip()
-    replacement = format_exif_offset(offset_minutes)
+    replacement = format_offset(offset_minutes)
     if SIGNED_OFFSET_PATTERN.search(original_text):
         return SIGNED_OFFSET_PATTERN.sub(replacement, original_text, count=1)
     return replacement
@@ -1472,7 +1464,7 @@ def plan_complete_timestamp_corrections(
         if align_to_selected:
             expected_local = selected_corrected_datetime
             if inline_offset is not None:
-                expected_offset = get_unambiguous_timezone_offset(
+                expected_offset = resolve_unambiguous_timezone_offset(
                     expected_local,
                     classification_timezone,
                 )
@@ -1492,7 +1484,7 @@ def plan_complete_timestamp_corrections(
                 )
                 expected = (expected_local, None)
         elif inline_offset is not None:
-            expected_offset = get_unambiguous_timezone_offset(
+            expected_offset = resolve_unambiguous_timezone_offset(
                 local_datetime,
                 classification_timezone,
             )
@@ -1589,7 +1581,7 @@ def plan_partial_timestamp_corrections(
                 if inline_offset is None:
                     expected_offset = None
                 else:
-                    expected_offset = get_unambiguous_timezone_offset(
+                    expected_offset = resolve_unambiguous_timezone_offset(
                         expected_local,
                         classification_timezone,
                     )
@@ -1601,7 +1593,7 @@ def plan_partial_timestamp_corrections(
                 expected_offset = None
             else:
                 expected_local = local_datetime
-                expected_offset = get_unambiguous_timezone_offset(
+                expected_offset = resolve_unambiguous_timezone_offset(
                     local_datetime,
                     classification_timezone,
                 )
@@ -1687,7 +1679,7 @@ def plan_offset_corrections(
                 if len(unique_reference_values) == 1
                 else selected_corrected_datetime
             )
-            expected_offset = get_unambiguous_timezone_offset(
+            expected_offset = resolve_unambiguous_timezone_offset(
                 reference_datetime,
                 classification_timezone,
             )
@@ -1741,7 +1733,7 @@ def plan_dst_setting_corrections(
     if not metadata_correction_active:
         return
 
-    expected_state = get_unambiguous_timezone_state(
+    expected_state = resolve_unambiguous_timezone_state(
         selected_corrected_datetime,
         classification_timezone,
     )
@@ -2171,16 +2163,6 @@ def choose_group_date(date_options, same_stem_files, file_dates):
 # overwrites, detect binary duplicates, and update only classified copies.
 
 
-def stems_are_related(base_stem, longer_stem):
-    """Return whether longer_stem is a non-numeric-suffix derivative."""
-    base_stem = base_stem.casefold()
-    longer_stem = longer_stem.casefold()
-    if len(longer_stem) <= len(base_stem) or not longer_stem.startswith(base_stem):
-        return False
-    first_added_character = longer_stem[len(base_stem)]
-    return not ("0" <= first_added_character <= "9")
-
-
 def group_related_files(files):
     """Group exact stems and attach derivatives to the longest matching base."""
     files_by_stem = {}
@@ -2193,9 +2175,20 @@ def group_related_files(files):
         key=lambda stem: (len(stem), stem.casefold()),
     )
     for stem in sorted_stems:
-        matching_bases = [
-            base_stem for base_stem in groups if stems_are_related(base_stem, stem)
-        ]
+        folded_stem = stem.casefold()
+        matching_bases = []
+        for base_stem in groups:
+            folded_base_stem = base_stem.casefold()
+            if len(folded_stem) <= len(folded_base_stem):
+                continue
+            if not folded_stem.startswith(folded_base_stem):
+                continue
+
+            first_added_character = folded_stem[len(folded_base_stem)]
+            if "0" <= first_added_character <= "9":
+                continue
+            matching_bases.append(base_stem)
+
         if matching_bases:
             groups[max(matching_bases, key=len)].extend(files_by_stem[stem])
         else:
@@ -2362,22 +2355,6 @@ def copy_file_with_corrected_metadata(
 # ============================================================================
 # Main exposes the complete startup sequence. Focused helpers below handle
 # metadata processing, per-group decisions, copying, and final reporting.
-
-
-def start_metadata_reader():
-    """Start one persistent ExifTool process for the complete run."""
-    try:
-        metadata_reader = ExifToolHelper(common_args=["-G0:1:4"])
-        metadata_reader.run()
-        return metadata_reader
-    except (FileNotFoundError, OSError, ValueError, ExifToolException) as error:
-        print(
-            "Error: PyExifTool could not start the ExifTool executable. "
-            "Install ExifTool and make sure it is available on PATH. "
-            f"Details: {error}"
-        )
-        input("Press Enter to exit")
-        raise SystemExit(1)
 
 
 def scan_related_group(metadata_reader, base_stem, same_stem_files):
@@ -2759,7 +2736,18 @@ def run_classification(
 ):
     """Process all related groups through one persistent ExifTool session."""
     same_stem_groups = group_related_files(source_files)
-    metadata_reader = start_metadata_reader()
+    try:
+        metadata_reader = ExifToolHelper(common_args=["-G0:1:4"])
+        metadata_reader.run()
+    except (FileNotFoundError, OSError, ValueError, ExifToolException) as error:
+        print(
+            "Error: PyExifTool could not start the ExifTool executable. "
+            "Install ExifTool and make sure it is available on PATH. "
+            f"Details: {error}"
+        )
+        input("Press Enter to exit")
+        return 1
+
     stats = {
         "copied": 0,
         "duplicates": 0,
