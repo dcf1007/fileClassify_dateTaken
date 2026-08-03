@@ -1,0 +1,258 @@
+name: Refactor code organization
+
+on:
+  pull_request:
+    branches:
+      - agent/replace-pillow-pyexiftool
+    paths:
+      - .github/tmp/run-code-organization-refactor
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  refactor-and-validate:
+    runs-on: ubuntu-latest
+    env:
+      ORIGINAL_HEAD: 3fe16d73273dbe652fbb408de0b77a3efa37fb29
+      FEATURE_BRANCH: agent/replace-pillow-pyexiftool
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/replace-pillow-pyexiftool
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Assemble and run the refactor
+        shell: bash
+        run: |
+          cat \
+            .github/tmp/refactor_code.part1 \
+            .github/tmp/refactor_code.part2 \
+            .github/tmp/refactor_code.part3 \
+            .github/tmp/refactor_code.part4 \
+            > /tmp/refactor_code.py
+          python -m py_compile /tmp/refactor_code.py
+          cp reclassify_datetaken.py /tmp/reclassify_before.py
+          python /tmp/refactor_code.py
+
+      - name: Install validation tools
+        shell: bash
+        run: |
+          python -m pip install -r requirements.txt black==24.10.0
+          sudo apt-get update
+          sudo apt-get install -y libimage-exiftool-perl
+
+      - name: Format and validate the refactored module
+        shell: bash
+        run: |
+          python -m black reclassify_datetaken.py
+          python -m py_compile reclassify_datetaken.py
+          git diff --check
+
+          python - <<'PY'
+          import ast
+          import importlib.util
+          from datetime import datetime
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          before_path = Path('/tmp/reclassify_before.py')
+          after_path = Path('reclassify_datetaken.py')
+          before_source = before_path.read_text(encoding='utf-8')
+          after_source = after_path.read_text(encoding='utf-8')
+
+          # Load only definitions from the pre-refactor script. Its historical
+          # module-level interactive code begins at the `directory` assignment.
+          before_tree = ast.parse(before_source)
+          safe_before_nodes = []
+          for node in before_tree.body:
+              if isinstance(node, ast.Assign) and any(
+                  isinstance(target, ast.Name) and target.id == 'directory'
+                  for target in node.targets
+              ):
+                  break
+              safe_before_nodes.append(node)
+          before_namespace = {'__name__': 'before_refactor'}
+          exec(
+              compile(
+                  ast.Module(body=safe_before_nodes, type_ignores=[]),
+                  str(before_path),
+                  'exec',
+              ),
+              before_namespace,
+          )
+
+          # Importing the refactored module must not prompt or start ExifTool.
+          spec = importlib.util.spec_from_file_location('after_refactor', after_path)
+          after_module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(after_module)
+
+          pure_vectors = {
+              'parse_timezone_offset_minutes': [
+                  ('Z',), ('+02:00',), ('-0530',), (None,),
+              ],
+              'parse_complete_metadata_datetime': [
+                  ('2024:09:14 00:40:47',),
+                  ('2024-09-14T00:40:47.37+02:00',),
+                  ('2024:09:14',),
+              ],
+              'parse_daylight_savings_value': [
+                  (True,), (0,), (60,), ('On',), ('standard time',),
+              ],
+              'parse_world_time_location': [
+                  (0,), (1,), ('Hometown',), ('travel',), ('unknown',),
+              ],
+              'derive_offset_from_utc': [
+                  (datetime(2024, 9, 14, 0, 40, 47),
+                   datetime(2024, 9, 13, 22, 40, 47)),
+              ],
+              'stems_are_related': [
+                  ('IMG_0001', 'IMG_0001-edit'),
+                  ('IMG_0001', 'IMG_00012'),
+              ],
+          }
+          for function_name, vectors in pure_vectors.items():
+              before_function = before_namespace[function_name]
+              after_function = getattr(after_module, function_name)
+              for arguments in vectors:
+                  assert before_function(*arguments) == after_function(*arguments), (
+                      function_name,
+                      arguments,
+                  )
+
+          files = [
+              Path('IMG_0001.jpg'),
+              Path('IMG_0001.xmp'),
+              Path('IMG_0001-edit.jpg'),
+              Path('IMG_00012.jpg'),
+          ]
+          assert before_namespace['group_related_files'](files) == (
+              after_module.group_related_files(files)
+          )
+
+          berlin = ZoneInfo('Europe/Berlin')
+          for local_time in (
+              datetime(2024, 1, 15, 12),
+              datetime(2024, 7, 15, 12),
+              datetime(2024, 3, 31, 2, 30),
+              datetime(2024, 10, 27, 2, 30),
+          ):
+              assert before_namespace['timezone_states_for_local_time'](
+                  local_time, berlin
+              ) == after_module.timezone_states_for_local_time(local_time, berlin)
+
+          source_metadata = {
+              'File:System:FileCreateDate': '2020:01:02 03:04:05+01:00',
+          }
+          before_operations = before_namespace['build_correction_operations'](
+              source_metadata,
+              None,
+              datetime(2024, 9, 14, 0, 40, 47),
+              berlin,
+              set(),
+              True,
+              120,
+          )
+          after_operations = after_module.build_correction_operations(
+              source_metadata,
+              None,
+              datetime(2024, 9, 14, 0, 40, 47),
+              berlin,
+              set(),
+              True,
+              120,
+          )
+          assert before_operations == after_operations
+
+          date_value = datetime(2024, 9, 14, 0, 40, 47)
+          date_options = after_module.build_date_options(
+              {
+                  Path('IMG_0001.jpg'): [
+                      (1, date_value, 'EXIF:DateTimeOriginal', 120),
+                      (1, date_value, 'XMP:CreateDate', 120),
+                  ]
+              }
+          )
+          selected, option, conflict, rejected = after_module.choose_group_date(
+              date_options,
+              [Path('IMG_0001.jpg')],
+              {
+                  Path('IMG_0001.jpg'): [
+                      (1, date_value, 'EXIF:DateTimeOriginal', 120),
+                  ]
+              },
+          )
+          assert selected == (1, date_value)
+          assert option['offset_records']
+          assert conflict is False
+          assert rejected == {}
+
+          after_tree = ast.parse(after_source)
+          functions = [
+              node for node in after_tree.body if isinstance(node, ast.FunctionDef)
+          ]
+          undocumented = [
+              node.name for node in functions if ast.get_docstring(node) is None
+          ]
+          assert not undocumented, undocumented
+
+          expected_sections = [
+              'CONFIGURATION AND METADATA POLICY',
+              'USER INPUT AND BASIC CONFIGURATION',
+              'EXIFTOOL METADATA READING AND VALUE PARSING',
+              'TIMEZONE AND DAYLIGHT-SAVING VALIDATION',
+              'METADATA AND FILESYSTEM CORRECTION WRITING',
+              'DATE CLASSIFICATION AND MISMATCH HANDLING',
+              'RELATED-FILE GROUPING AND COLLISION-SAFE COPYING',
+              'CLASSIFICATION WORKFLOW AND COMMAND-LINE ENTRY POINT',
+          ]
+          positions = [after_source.index(section) for section in expected_sections]
+          assert positions == sorted(positions)
+          assert 'if __name__ == "__main__":' in after_source
+          assert '## Code organization' in Path('README.md').read_text(
+              encoding='utf-8'
+          )
+          PY
+
+          exiftool -ver
+
+      - name: Commit one clean refactor commit
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          rm -f \
+            .github/workflows/refactor-code-organization.yml \
+            .github/tmp/refactor_code.part1 \
+            .github/tmp/refactor_code.part2 \
+            .github/tmp/refactor_code.part3 \
+            .github/tmp/refactor_code.part4
+
+          git add -A
+          git reset --soft "$ORIGINAL_HEAD"
+          git commit -m "Reorganize classifier by responsibility"
+          git push --force-with-lease origin "HEAD:$FEATURE_BRANCH"
+
+      - name: Restore the original branch if validation fails
+        if: failure()
+        shell: bash
+        run: |
+          git reset --hard "$ORIGINAL_HEAD"
+          git push --force origin "HEAD:$FEATURE_BRANCH"
+
+      - name: Close trigger PR and delete trigger branch
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh pr close "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" || true
+          git push origin --delete "${{ github.event.pull_request.head.ref }}" || true
