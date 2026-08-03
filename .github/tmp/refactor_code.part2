@@ -1,0 +1,260 @@
+
+        if not scan["file_dates"]:
+            for base_image_file in scan["base_image_files"]:
+                try:
+                    file_modify_candidate, review_reason = get_file_modify_date(
+                        metadata_reader,
+                        base_image_file,
+                    )
+                except OSError as error:
+                    print(
+                        f"Error reading '{base_image_file.name}': {error}",
+                        file=sys.stderr,
+                    )
+                    scan["failures"] += 1
+                    scan["usable_files"].discard(base_image_file)
+                    continue
+
+                if review_reason is not None:
+                    print(
+                        f"Warning: '{base_image_file.name}' requires review: "
+                        f"{review_reason}",
+                        file=sys.stderr,
+                    )
+                    scan["review_reasons"][base_image_file] = review_reason
+                    scan["usable_files"].discard(base_image_file)
+                    continue
+
+                scan["file_dates"].setdefault(base_image_file, []).append(
+                    file_modify_candidate
+                )
+
+        if not scan["file_dates"]:
+            for same_stem_file in scan["usable_files"]:
+                scan["review_reasons"][same_stem_file] = (
+                    "no embedded timestamp and no base image FileModifyDate"
+                )
+
+        return scan
+
+
+    def build_date_options(file_dates):
+        """
+        Merge identical timestamps from all related files into display options.
+
+        Each option retains its strongest date type, source fields, and explicit
+        offsets so later conflict and timezone review can use the same evidence.
+        """
+        date_options = {}
+        for same_stem_file, date_candidates in file_dates.items():
+            for (
+                date_type,
+                date_value,
+                source_name,
+                timezone_offset_minutes,
+            ) in date_candidates:
+                date_option = date_options.setdefault(
+                    date_value,
+                    {
+                        "date_type": date_type,
+                        "sources": [],
+                        "offset_records": [],
+                    },
+                )
+                date_option["date_type"] = max(
+                    date_option["date_type"],
+                    date_type,
+                )
+                date_option["sources"].append((same_stem_file, source_name))
+
+                if timezone_offset_minutes is not None:
+                    offset_record = (
+                        same_stem_file,
+                        source_name,
+                        timezone_offset_minutes,
+                    )
+                    if offset_record not in date_option["offset_records"]:
+                        date_option["offset_records"].append(offset_record)
+        return date_options
+
+
+    def choose_group_date(date_options, same_stem_files, file_dates):
+        """
+        Select the authoritative group timestamp and record rejected values.
+
+        A single date is accepted silently. Multiple distinct dates are shown
+        with their exact metadata sources, and the user's selection determines
+        which rejected capture/creation values are aligned in classified copies.
+        """
+        if not date_options:
+            return None, None, False, {}
+
+        if len(date_options) == 1:
+            date_value, date_option = next(iter(date_options.items()))
+            return (
+                (date_option["date_type"], date_value),
+                date_option,
+                False,
+                {},
+            )
+
+        sorted_date_options = sorted(date_options.items())
+        print()
+        print("Conflicting dates found for this related group:")
+        for same_stem_file in same_stem_files:
+            print(f"  - {same_stem_file.name}")
+
+        print("Choose the date that should be used for this group:")
+        for option_number, (date_value, date_option) in enumerate(
+            sorted_date_options,
+            start=1,
+        ):
+            print(
+                f"  {option_number}. "
+                f"{date_value.strftime('%Y-%m-%d %H:%M:%S')} - "
+                f"{format_date_sources(date_option['sources'])}"
+            )
+
+        while True:
+            raw_selection = input(
+                f"Enter a number from 1 to {len(sorted_date_options)}: "
+            ).strip()
+            try:
+                selected_option_number = int(raw_selection)
+            except ValueError:
+                print("Invalid selection. Enter one of the listed numbers.")
+                continue
+
+            if not 1 <= selected_option_number <= len(sorted_date_options):
+                print("Invalid selection. Enter one of the listed numbers.")
+                continue
+
+            selected_date_value, selected_date_option = sorted_date_options[
+                selected_option_number - 1
+            ]
+            selected_file_date = (
+                selected_date_option["date_type"],
+                selected_date_value,
+            )
+            print(
+                "Selected date: "
+                f"{selected_date_value.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+            print()
+            break
+
+        conflicting_date_values_by_file = {
+            filename: {
+                candidate[1]
+                for candidate in candidates
+                if candidate[0] == 1 and candidate[1] != selected_date_value
+            }
+            for filename, candidates in file_dates.items()
+        }
+        conflicting_date_values_by_file = {
+            filename: values
+            for filename, values in conflicting_date_values_by_file.items()
+            if values
+        }
+
+        return (
+            selected_file_date,
+            selected_date_option,
+            True,
+            conflicting_date_values_by_file,
+        )
+
+
+    def review_group_timezone(
+        selected_file_date,
+        selected_date_option,
+        scan,
+        timezone_name,
+        classification_timezone,
+        automatic_correction_rules,
+    ):
+        """
+        Apply timezone/DST review and return the final date plus write context.
+
+        The returned delta is non-None only when the user, or a matching
+        session rule, accepted a timezone correction. The preferred system
+        offset is taken from the selected timestamp only when it is unique.
+        """
+        if selected_file_date is None or selected_date_option is None:
+            return selected_file_date, None, None
+
+        uncorrected_datetime = selected_file_date[1]
+        selected_file_date = review_timezone_evidence(
+            selected_file_date,
+            selected_date_option,
+            scan["base_capture_files"],
+            scan["context_records_by_file"],
+            scan["utc_records_by_file"],
+            timezone_name,
+            classification_timezone,
+            automatic_correction_rules,
+        )
+
+        timezone_correction_delta = None
+        if selected_file_date[0] == 2:
+            timezone_correction_delta = (
+                selected_file_date[1] - uncorrected_datetime
+            )
+
+        selected_offsets = {
+            offset_record[2]
+            for offset_record in selected_date_option.get("offset_records", [])
+        }
+        preferred_system_offset_minutes = (
+            next(iter(selected_offsets)) if len(selected_offsets) == 1 else None
+        )
+        return (
+            selected_file_date,
+            timezone_correction_delta,
+            preferred_system_offset_minutes,
+        )
+
+
+    def copy_group_files(
+        metadata_reader,
+        same_stem_files,
+        scan,
+        selected_file_date,
+        date_conflict_resolved,
+        conflicting_date_values_by_file,
+        timezone_correction_delta,
+        preferred_system_offset_minutes,
+        classification_timezone,
+        classified_directory,
+        unclassified_directory,
+        stats,
+    ):
+        """
+        Copy one related group and apply approved metadata/system corrections.
+
+        Review files go to ``unclassified``. Classified files use the selected
+        date folder, collision-safe copying, and the existing correction writer.
+        All counters and console reporting are updated in this one place.
+        """
+        review_reasons = scan["review_reasons"]
+        usable_files = scan["usable_files"]
+
+        for same_stem_file in same_stem_files:
+            if same_stem_file in review_reasons:
+                folder_name = UNCLASSIFIED_FOLDER_NAME
+                destination_directory = unclassified_directory
+            elif same_stem_file in usable_files and selected_file_date is not None:
+                date_folder_name = selected_file_date[1].strftime("%Y-%m-%d")
+                folder_name = f"{CLASSIFIED_FOLDER_NAME}/{date_folder_name}"
+                destination_directory = classified_directory / date_folder_name
+            else:
+                continue
+
+            if (
+                destination_directory.exists()
+                and not destination_directory.is_dir()
+            ):
+                print(
+                    f"Error: '{destination_directory}' is a file. "
+                    f"Skipping '{same_stem_file.name}'.",
+                    file=sys.stderr,
