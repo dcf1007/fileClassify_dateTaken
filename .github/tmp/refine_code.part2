@@ -1,0 +1,402 @@
+NEW_CORRECTION_PLANNER += "\n\n" + textwrap.dedent(
+    r'''
+    def plan_offset_corrections(
+        values_by_tag,
+        corrected_local_values,
+        metadata_correction_active,
+        selected_corrected_datetime,
+        classification_timezone,
+        operations,
+        skipped,
+    ):
+        """Plan writes for existing standalone offset fields."""
+        if not metadata_correction_active:
+            return
+
+        inverse_offset_tags = {
+            offset_tag: date_tag
+            for date_tag, offset_tag in ASSOCIATED_OFFSET_TAGS.items()
+        }
+        for tag_name in sorted(OFFSET_CONTEXT_TAGS):
+            for metadata_key, groups, raw_value in values_by_tag.get(
+                tag_name,
+                [],
+            ):
+                family_zero = groups[0] if groups else ""
+                reference_values = corrected_local_values.get(
+                    (family_zero, inverse_offset_tags.get(tag_name)),
+                    [],
+                )
+                unique_reference_values = set(reference_values)
+                reference_datetime = (
+                    next(iter(unique_reference_values))
+                    if len(unique_reference_values) == 1
+                    else selected_corrected_datetime
+                )
+                expected_offset = get_unambiguous_timezone_offset(
+                    reference_datetime,
+                    classification_timezone,
+                )
+                if expected_offset is None:
+                    skipped.add(
+                        f"{metadata_key} (ambiguous corrected offset)"
+                    )
+                    continue
+
+                write_target = get_metadata_write_target(
+                    groups,
+                    tag_name,
+                    raw=(
+                        tag_name == "TimeZoneOffset"
+                        and isinstance(raw_value, (int, float))
+                    ),
+                )
+                if write_target is None:
+                    continue
+
+                add_correction_operation(
+                    operations,
+                    skipped,
+                    {
+                        "target": write_target,
+                        "value": format_context_offset_value(
+                            tag_name,
+                            raw_value,
+                            expected_offset,
+                        ),
+                        "kind": "offset",
+                        "expected": expected_offset,
+                        "tag_name": tag_name,
+                        "source": metadata_key,
+                    },
+                )
+
+
+    def plan_dst_setting_corrections(
+        values_by_tag,
+        metadata_correction_active,
+        selected_corrected_datetime,
+        classification_timezone,
+        operations,
+        skipped,
+    ):
+        """
+        Plan writes for direct or active-profile daylight-saving settings.
+
+        The active Pentax/Ricoh profile is selected from WorldTimeLocation. The
+        inactive profile remains unchanged, and no camera make/model dispatch is
+        needed.
+        """
+        if not metadata_correction_active:
+            return
+
+        expected_state = get_unambiguous_timezone_state(
+            selected_corrected_datetime,
+            classification_timezone,
+        )
+        if expected_state is None:
+            return
+
+        expected_dst = expected_state[0]
+        active_profiles = {
+            parse_world_time_location(raw_value)
+            for _, _, raw_value in values_by_tag.get(
+                PROFILE_SELECTOR_TAG,
+                [],
+            )
+        }
+        active_profiles.discard(None)
+
+        active_profile_tag = None
+        if len(active_profiles) == 1:
+            active_profile_tag = PROFILE_DST_TAGS[
+                next(iter(active_profiles))
+            ]
+
+        dst_tag_names = set(DIRECT_DST_TAGS)
+        if active_profile_tag is not None:
+            dst_tag_names.add(active_profile_tag)
+
+        for tag_name in sorted(dst_tag_names):
+            for metadata_key, groups, raw_value in values_by_tag.get(
+                tag_name,
+                [],
+            ):
+                write_target = get_metadata_write_target(
+                    groups,
+                    tag_name,
+                    raw=True,
+                )
+                if write_target is None:
+                    continue
+
+                add_correction_operation(
+                    operations,
+                    skipped,
+                    {
+                        "target": write_target,
+                        "value": raw_dst_write_value(
+                            groups,
+                            raw_value,
+                            expected_dst,
+                        ),
+                        "kind": "dst",
+                        "expected": expected_dst,
+                        "tag_name": tag_name,
+                        "source": metadata_key,
+                    },
+                )
+
+
+    def plan_file_create_date_alignment(
+        records,
+        align_system_times,
+        selected_corrected_datetime,
+        classification_timezone,
+        preferred_system_offset_minutes,
+        operations,
+        skipped,
+    ):
+        """Align an existing FileCreateDate to the absolute selected instant."""
+        if not align_system_times:
+            return
+
+        expected_offset = resolve_system_timestamp_offset(
+            selected_corrected_datetime,
+            classification_timezone,
+            preferred_system_offset_minutes,
+        )
+        if expected_offset is None:
+            skipped.add(
+                "FileCreateDate (ambiguous selected-date UTC offset)"
+            )
+            return
+
+        expected = (selected_corrected_datetime, expected_offset)
+        for metadata_key, groups, tag_name, raw_value in records:
+            if tag_name != "FileCreateDate":
+                continue
+            try:
+                parsed = parse_complete_metadata_datetime(raw_value)
+            except ValueError:
+                parsed = None
+            if parsed is None:
+                skipped.add(
+                    f"{metadata_key} (invalid FileCreateDate)"
+                )
+                continue
+            if parsed == expected:
+                continue
+
+            add_correction_operation(
+                operations,
+                skipped,
+                {
+                    "target": "FileCreateDate",
+                    "value": format_complete_datetime(
+                        raw_value,
+                        selected_corrected_datetime,
+                        expected_offset,
+                    ),
+                    "kind": "datetime",
+                    "expected": expected,
+                    "tag_name": tag_name,
+                    "source": metadata_key,
+                },
+            )
+
+
+    def build_correction_operations(
+        source_metadata,
+        correction_delta,
+        selected_corrected_datetime,
+        classification_timezone,
+        conflicting_date_values=None,
+        align_system_times=False,
+        preferred_system_offset_minutes=None,
+    ):
+        """
+        Build all metadata and FileCreateDate writes for a classified copy.
+
+        The wrapper coordinates focused planners for complete timestamps, paired
+        date/time fields, offsets, DST settings, and system creation time. Each
+        planner adds absolute, verifiable operations to the same operation map.
+        """
+        timezone_correction_active = correction_delta is not None
+        effective_correction_delta = correction_delta or timedelta(0)
+        conflicting_date_values = set(conflicting_date_values or ())
+        metadata_correction_active = (
+            timezone_correction_active or bool(conflicting_date_values)
+        )
+
+        operations = {}
+        skipped = set()
+        records = list(iter_metadata_values(source_metadata))
+        records_by_family_tag, values_by_tag = index_correction_metadata(
+            records
+        )
+
+        corrected_local_values = plan_complete_timestamp_corrections(
+            records,
+            records_by_family_tag,
+            timezone_correction_active,
+            effective_correction_delta,
+            selected_corrected_datetime,
+            classification_timezone,
+            conflicting_date_values,
+            operations,
+            skipped,
+        )
+        plan_partial_timestamp_corrections(
+            records_by_family_tag,
+            timezone_correction_active,
+            effective_correction_delta,
+            selected_corrected_datetime,
+            classification_timezone,
+            conflicting_date_values,
+            operations,
+            skipped,
+        )
+        plan_offset_corrections(
+            values_by_tag,
+            corrected_local_values,
+            metadata_correction_active,
+            selected_corrected_datetime,
+            classification_timezone,
+            operations,
+            skipped,
+        )
+        plan_dst_setting_corrections(
+            values_by_tag,
+            metadata_correction_active,
+            selected_corrected_datetime,
+            classification_timezone,
+            operations,
+            skipped,
+        )
+        plan_file_create_date_alignment(
+            records,
+            align_system_times,
+            selected_corrected_datetime,
+            classification_timezone,
+            preferred_system_offset_minutes,
+            operations,
+            skipped,
+        )
+        return list(operations.values()), skipped
+    '''
+).strip()
+
+
+def apply_small_cleanups(source: str) -> str:
+    """Apply behavior-neutral readability and consistency cleanups."""
+    exact_replacements = {
+        'EXIF_DATE_FORMAT = "%Y:%m:%d %H:%M:%S"\n\n': "",
+        "params=[],\n        )\n    except ExifToolException as error:\n        raise OSError(\n            f\"ExifTool could not read FileModifyDate from '{filename}': \" f\"{error}\"\n": (
+            "params=FILE_MODIFY_DATE_PARAMS,\n"
+            "        )\n"
+            "    except ExifToolException as error:\n"
+            "        raise OSError(\n"
+            "            f\"ExifTool could not read FileModifyDate from "
+            "'{filename}': {error}\"\n"
+        ),
+        "f\"ExifTool could not inspect correction fields in '{filename}': \" f\"{error}\"": (
+            "f\"ExifTool could not inspect correction fields in "
+            "'{filename}': {error}\""
+        ),
+        '"Timezone for timezone/DST checks " f"[{DEFAULT_TIMEZONE_NAME}]: "': (
+            'f"Timezone for timezone/DST checks [{DEFAULT_TIMEZONE_NAME}]: "'
+        ),
+        '"  Selected local time: " f"{selected_datetime.strftime(\'%Y-%m-%d %H:%M:%S\')}"': (
+            'f"  Selected local time: "\n'
+            '            f"{selected_datetime.strftime(\'%Y-%m-%d %H:%M:%S\')}"'
+        ),
+        'print("  1. Keep " f"{selected_datetime.strftime(\'%Y-%m-%d %H:%M:%S\')}")': (
+            'print(\n'
+            '        f"  1. Keep "\n'
+            '        f"{selected_datetime.strftime(\'%Y-%m-%d %H:%M:%S\')}"\n'
+            '    )'
+        ),
+        'print("Selected date: " f"{selected_date_value.strftime(\'%Y-%m-%d %H:%M:%S\')}")': (
+            'print(\n'
+            '            f"Selected date: "\n'
+            '            f"{selected_date_value.strftime(\'%Y-%m-%d %H:%M:%S\')}"\n'
+            '        )'
+        ),
+        'f"Error copying or updating \'{same_stem_file.name}\': " f"{error}"': (
+            'f"Error copying or updating \'{same_stem_file.name}\': "\n'
+            '                f"{error}"'
+        ),
+        'print("Copies with corrected metadata/system time: " f"{stats[\'metadata_updated\']}")': (
+            'print(\n'
+            '        "Copies with corrected metadata/system time: "\n'
+            '        f"{stats[\'metadata_updated\']}"\n'
+            '    )'
+        ),
+        '\n\nif __name__ == "__main__":\n\n    raise SystemExit(main())\n': (
+            '\n\nif __name__ == "__main__":\n'
+            '    raise SystemExit(main())\n'
+        ),
+    }
+
+    for old, new in exact_replacements.items():
+        count = source.count(old)
+        if count != 1:
+            raise SystemExit(
+                f"Expected one cleanup match, found {count}: {old[:80]!r}"
+            )
+        source = source.replace(old, new, 1)
+
+    old_return = textwrap.dedent(
+        '''
+        return (
+            directory,
+            timezone_name,
+            classification_timezone,
+            classified_directory,
+            unclassified_directory,
+            source_files,
+        )
+        '''
+    ).strip()
+    new_return = textwrap.dedent(
+        '''
+        return (
+            timezone_name,
+            classification_timezone,
+            classified_directory,
+            unclassified_directory,
+            source_files,
+        )
+        '''
+    ).strip()
+    if source.count(old_return) != 1:
+        raise SystemExit("prepare_run return block was not found exactly once")
+    source = source.replace(old_return, new_return, 1)
+
+    old_unpack = textwrap.dedent(
+        '''
+        (
+            _directory,
+            timezone_name,
+            classification_timezone,
+            classified_directory,
+            unclassified_directory,
+            source_files,
+        ) = prepare_run()
+        '''
+    ).strip()
+    new_unpack = textwrap.dedent(
+        '''
+        (
+            timezone_name,
+            classification_timezone,
+            classified_directory,
+            unclassified_directory,
+            source_files,
+        ) = prepare_run()
+        '''
+    ).strip()
+    if source.count(old_unpack) != 1:
+        raise SystemExit("main unpack block was not found exactly once")
+    return source.replace(old_unpack, new_unpack, 1)
