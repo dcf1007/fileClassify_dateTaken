@@ -2336,7 +2336,7 @@ try:
 
             date_conflict_resolved = True
 
-    # Remember the rejected embedded values per file. The copy pass
+            # Remember the rejected embedded values per file. The copy pass
             # aligns only eligible capture/creation fields carrying one of
             # these values; unrelated timestamps are not overwritten.
             conflicting_date_values_by_file = {
@@ -2374,15 +2374,17 @@ try:
                     selected_file_date[1] - uncorrected_datetime
                 )
 
-        selected_offsets = {
-            offset_record[2]
-            for offset_record in selected_date_option.get(
-                "offset_records",
-                [],
-            )
-        }
-        if len(selected_offsets) == 1:
-            preferred_system_offset_minutes = next(iter(selected_offsets))
+            selected_offsets = {
+                offset_record[2]
+                for offset_record in selected_date_option.get(
+                    "offset_records",
+                    [],
+                )
+            }
+            if len(selected_offsets) == 1:
+                preferred_system_offset_minutes = next(
+                    iter(selected_offsets)
+                )
 
         for same_stem_file in same_stem_files:
             if same_stem_file in review_reasons:
