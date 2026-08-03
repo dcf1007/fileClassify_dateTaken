@@ -1,0 +1,172 @@
+name: Apply system date alignment v2
+
+on:
+  pull_request:
+    branches:
+      - agent/replace-pillow-pyexiftool
+    paths:
+      - .github/tmp/run-system-date-alignment-v2
+
+permissions:
+  contents: write
+
+jobs:
+  update-feature-branch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/replace-pillow-pyexiftool
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Apply corrected transformation
+        shell: bash
+        run: |
+          awk '
+            /^          python - <<.PY./ { capture = 1; next }
+            capture && /^          PY$/ { exit }
+            capture { sub(/^          /, ""); print }
+          ' .github/workflows/apply-system-date-alignment.yml > /tmp/apply.py
+
+          python - <<'PY'
+          from pathlib import Path
+
+          patch_path = Path("/tmp/apply.py")
+          patch_text = patch_path.read_text(encoding="utf-8")
+          malformed = (
+              "\n    # aligns only eligible capture/creation fields carrying one of\n"
+              "    # these values; unrelated timestamps are not overwritten.\n"
+              "    conflicting_date_values_by_file = {"
+          )
+          corrected = (
+              "\n            # aligns only eligible capture/creation fields carrying one of\n"
+              "            # these values; unrelated timestamps are not overwritten.\n"
+              "            conflicting_date_values_by_file = {"
+          )
+          if malformed not in patch_text:
+              raise SystemExit("temporary patch indentation marker was not found")
+          patch_path.write_text(
+              patch_text.replace(malformed, corrected),
+              encoding="utf-8",
+          )
+          PY
+
+          python /tmp/apply.py
+
+      - name: Compile and run focused regression checks
+        shell: bash
+        run: |
+          python -m pip install -r requirements.txt
+          python -m py_compile reclassify_datetaken.py
+          python - <<'PY'
+          import ast
+          import os
+          import tempfile
+          from datetime import datetime
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          source_path = Path("reclassify_datetaken.py")
+          source = source_path.read_text(encoding="utf-8")
+          tree = ast.parse(source)
+          safe_body = []
+          for node in tree.body:
+              if isinstance(node, ast.Assign) and any(
+                  isinstance(target, ast.Name) and target.id == "directory"
+                  for target in node.targets
+              ):
+                  break
+              safe_body.append(node)
+          namespace = {}
+          exec(
+              compile(
+                  ast.Module(body=safe_body, type_ignores=[]),
+                  str(source_path),
+                  "exec",
+              ),
+              namespace,
+          )
+
+          berlin = ZoneInfo("Europe/Berlin")
+          summer = datetime(2024, 9, 14, 0, 40, 47)
+          repeated = datetime(2024, 10, 27, 2, 30, 0)
+          resolve_offset = namespace["resolve_system_timestamp_offset"]
+          to_epoch_ns = namespace["system_datetime_to_epoch_ns"]
+          assert resolve_offset(summer, berlin) == 120
+          assert resolve_offset(repeated, berlin) is None
+          assert resolve_offset(repeated, berlin, 60) == 60
+          assert to_epoch_ns(datetime(1970, 1, 1), 0) == 0
+
+          operations, skipped = namespace["build_correction_operations"](
+              {
+                  "File:System:FileCreateDate":
+                      "2020:01:02 03:04:05+01:00",
+              },
+              None,
+              summer,
+              berlin,
+              set(),
+              True,
+              120,
+          )
+          file_create = [
+              operation
+              for operation in operations
+              if operation["target"] == "FileCreateDate"
+          ]
+          assert len(file_create) == 1
+          assert file_create[0]["expected"] == (summer, 120)
+          assert file_create[0]["value"] == "2024:09:14 00:40:47+02:00"
+          assert skipped == set()
+
+          namespace["read_correction_metadata"] = lambda *args: {}
+          namespace["build_correction_operations"] = lambda *args: ([], set())
+          namespace["execute_correction_operations"] = lambda *args: ([], [])
+          with tempfile.TemporaryDirectory() as temp_directory:
+              test_file = Path(temp_directory) / "copy.nef"
+              test_file.write_bytes(b"test")
+              os.utime(test_file, ns=(0, 0))
+              updated, skipped = namespace["update_corrected_copy_metadata"](
+                  object(),
+                  test_file,
+                  test_file,
+                  None,
+                  summer,
+                  berlin,
+                  set(),
+                  True,
+                  120,
+              )
+              assert test_file.stat().st_mtime_ns == to_epoch_ns(summer, 120)
+              assert updated == ["FileModifyDate"]
+              assert skipped == []
+
+          required = (
+              "date_conflict_resolved = True",
+              "align_system_times = (",
+              "preferred_system_offset_minutes",
+              "FileModifyDate (ambiguous selected-date UTC offset)",
+          )
+          missing = [marker for marker in required if marker not in source]
+          if missing:
+              raise SystemExit(f"missing system-time alignment markers: {missing}")
+
+          readme = Path("README.md").read_text(encoding="utf-8")
+          if "Every classified copy in the related group receives" not in readme:
+              raise SystemExit("README system-time documentation is missing")
+          PY
+
+      - name: Commit finalized files and remove temporary workflows
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm -f .github/workflows/apply-system-date-alignment.yml
+          git rm -f .github/workflows/apply-system-date-alignment-v2.yml
+          git add reclassify_datetaken.py README.md
+          git commit -m "Align system file dates to selected value"
+          git push origin HEAD:agent/replace-pillow-pyexiftool
