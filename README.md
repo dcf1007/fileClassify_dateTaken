@@ -4,6 +4,24 @@ Python script that takes the files directly inside a selected directory and copi
 
 The script does not scan subdirectories. Classified copies are written to `classified/YYYY-MM-DD`, while damaged files or files with unreliable image metadata are copied to `unclassified` for manual review. Original files are not moved or overwritten.
 
+## Code organization
+
+`reclassify_datetaken.py` remains a single-file utility, but it is divided
+into explicit responsibility sections:
+
+- configuration and metadata policy;
+- ExifTool metadata reading and value parsing;
+- timezone and daylight-saving validation;
+- metadata and filesystem correction writing;
+- date classification and mismatch handling;
+- related-file grouping and collision-safe copying;
+- the high-level classification workflow and command-line entry point.
+
+The low-level metadata and timezone rules are kept separate from prompts
+and file-copy orchestration. The bottom of the file contains `main()` and
+the small workflow functions, so the complete execution path can be read
+from top to bottom without following module-level procedural code.
+
 ## Metadata extraction
 
 The first pass uses PyExifTool to request ExifTool's complete `Time:All` group with duplicate and embedded metadata enabled:
