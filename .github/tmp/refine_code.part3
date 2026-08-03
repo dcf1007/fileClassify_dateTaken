@@ -1,0 +1,16 @@
+
+def main() -> None:
+    """Apply the focused correction-planner and readability refactor."""
+    source = SOURCE_PATH.read_text(encoding="utf-8")
+    source = replace_function(
+        source,
+        "build_correction_operations",
+        NEW_CORRECTION_PLANNER,
+    )
+    source = apply_small_cleanups(source)
+    ast.parse(source)
+    SOURCE_PATH.write_text(source, encoding="utf-8")
+
+
+if __name__ == "__main__":
+    main()
