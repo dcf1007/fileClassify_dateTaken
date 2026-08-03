@@ -26,6 +26,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -274,6 +275,7 @@ class ParsedMetadataDateTime:
     local_date: date | None
     local_time: datetime_time | None
     utc_offset_minutes: int | None
+    fraction: str | None = None
 
     @property
     def local_datetime(self):
@@ -360,37 +362,29 @@ def parse_metadata_offset_minutes(tag_name, metadata_value):
     return sign * (hours * 60 + minutes)
 
 
-def parse_metadata_datetime(date_value, time_value=None):
+def parse_metadata_datetime(date_value):
     """
-    Parse complete, date-only, time-only, or paired metadata date/time values.
+    Parse one complete, date-only, or time-only metadata value.
 
-    ``None`` means the supplied representation is not recognized. Recognized
-    but impossible calendar/clock values raise ``ValueError``. Missing date or
-    time components remain ``None`` and are never invented. An explicit offset
-    is returned beside the naive local wall clock and is not applied to it,
-    because folder classification uses the camera's local capture date.
+    ``None`` means the representation is not recognized. Recognized but
+    impossible calendar, clock, or offset values raise ``ValueError``. Missing
+    date or time components remain ``None`` and are never invented. Explicit
+    offsets remain separate from the naive local wall clock because folder
+    classification follows the camera's local capture date.
 
-    The optional paired form remains a parsing utility, but consensus does not
-    synthesize IPTC pairs. It relies on ExifTool's complete Composite timestamp
-    and later updates whichever writable components actually exist.
+    Fractional seconds are retained exactly in ``fraction`` and represented to
+    microsecond precision in ``local_time`` for ordinary civil-time operations.
+    Consensus threshold arithmetic separately uses the complete fraction string.
+    Separate date/time fields are not paired here; ExifTool Composite values are
+    the complete consensus candidates, while writable components are updated only
+    after the final consensus is selected.
     """
-    if time_value is not None:
-        parsed_date = parse_metadata_datetime(date_value)
-        parsed_time = parse_metadata_datetime(time_value)
-        if parsed_date is None or parsed_time is None:
-            return None
-        if parsed_date.local_date is None or parsed_time.local_time is None:
-            return None
-        return ParsedMetadataDateTime(
-            parsed_date.local_date,
-            parsed_time.local_time,
-            parsed_time.utc_offset_minutes,
-        )
-
     value_text = str(date_value).strip()
 
     complete_match = COMPLETE_DATE_TIME_PATTERN.fullmatch(value_text)
     if complete_match is not None:
+        fraction = complete_match.group("fraction")
+        microsecond = int(((fraction or "") + "000000")[:6] or "0")
         parsed_date = date(
             int(complete_match.group("year")),
             int(complete_match.group("month")),
@@ -400,11 +394,13 @@ def parse_metadata_datetime(date_value, time_value=None):
             int(complete_match.group("hour")),
             int(complete_match.group("minute")),
             int(complete_match.group("second")),
+            microsecond,
         )
         return ParsedMetadataDateTime(
             parsed_date,
             parsed_time,
             parse_utc_offset_minutes(complete_match.group("timezone")),
+            fraction,
         )
 
     date_match = DATE_ONLY_PATTERN.fullmatch(value_text)
@@ -421,14 +417,18 @@ def parse_metadata_datetime(date_value, time_value=None):
 
     time_match = TIME_ONLY_PATTERN.fullmatch(value_text)
     if time_match is not None:
+        fraction = time_match.group("fraction")
+        microsecond = int(((fraction or "") + "000000")[:6] or "0")
         return ParsedMetadataDateTime(
             None,
             datetime_time(
                 int(time_match.group("hour")),
                 int(time_match.group("minute")),
                 int(time_match.group("second")),
+                microsecond,
             ),
             parse_utc_offset_minutes(time_match.group("timezone")),
+            fraction,
         )
 
     return None
@@ -512,8 +512,46 @@ def format_offset(offset_minutes):
     return f"{sign}{hours:02d}:{minutes:02d}"
 
 
-def format_complete_datetime(original_value, local_datetime, offset_minutes=None):
-    """Preserve a complete timestamp's syntax while replacing its value."""
+def format_consensus_datetime(local_datetime, fraction=None):
+    """Format a selected timestamp without discarding its exact subseconds."""
+    formatted = local_datetime.strftime("%Y-%m-%d %H:%M:%S")
+    if fraction:
+        formatted += f".{fraction}"
+    elif local_datetime.microsecond:
+        formatted += f".{local_datetime.microsecond:06d}".rstrip("0")
+    return formatted
+
+
+def fit_fraction_to_precision(fraction, microsecond, precision):
+    """Represent the selected fraction using an existing field's precision."""
+    selected_fraction = fraction
+    if selected_fraction is None:
+        selected_fraction = f"{microsecond:06d}"
+    return (selected_fraction + "0" * precision)[:precision]
+
+
+def capture_time_value(local_datetime, fraction=None):
+    """Return exact decimal seconds for ordering and threshold comparison."""
+    whole_datetime = local_datetime.replace(microsecond=0)
+    epoch = datetime(1970, 1, 1)
+    delta = whole_datetime - epoch
+    whole_seconds = delta.days * 86400 + delta.seconds
+    exact_fraction = fraction
+    if exact_fraction is None and local_datetime.microsecond:
+        exact_fraction = f"{local_datetime.microsecond:06d}"
+    fractional_seconds = (
+        Decimal(f"0.{exact_fraction}") if exact_fraction else Decimal(0)
+    )
+    return Decimal(whole_seconds) + fractional_seconds
+
+
+def format_complete_datetime(
+    original_value,
+    local_datetime,
+    offset_minutes=None,
+    fraction=None,
+):
+    """Preserve a complete field's syntax/precision while replacing its value."""
     original_text = str(original_value).strip()
     date_match = COMPLETE_DATE_TIME_PATTERN.fullmatch(original_text)
     if date_match is None:
@@ -528,11 +566,13 @@ def format_complete_datetime(original_value, local_datetime, offset_minutes=None
         f"{local_datetime.hour:02d}:{local_datetime.minute:02d}:"
         f"{local_datetime.second:02d}"
     )
-    # Fractional precision is intentionally field-local. Threshold consensus
-    # compares whole seconds, while correction preserves each existing suffix.
-    fraction = date_match.group("fraction")
-    if fraction is not None:
-        formatted += f".{fraction}"
+    original_fraction = date_match.group("fraction")
+    if original_fraction is not None:
+        formatted += "." + fit_fraction_to_precision(
+            fraction,
+            local_datetime.microsecond,
+            len(original_fraction),
+        )
 
     timezone_text = date_match.group("timezone")
     if offset_minutes is not None:
@@ -555,8 +595,13 @@ def format_date_only(original_value, local_datetime):
     )
 
 
-def format_time_only(original_value, local_datetime, offset_minutes=None):
-    """Preserve fractional precision while replacing a time-only value."""
+def format_time_only(
+    original_value,
+    local_datetime,
+    offset_minutes=None,
+    fraction=None,
+):
+    """Preserve a time field's syntax/precision while replacing its value."""
     original_text = str(original_value).strip()
     time_match = TIME_ONLY_PATTERN.fullmatch(original_text)
     if time_match is None:
@@ -566,10 +611,13 @@ def format_time_only(original_value, local_datetime, offset_minutes=None):
         f"{local_datetime.hour:02d}:{local_datetime.minute:02d}:"
         f"{local_datetime.second:02d}"
     )
-    # As with complete timestamps, preserve the source field's own fraction.
-    fraction = time_match.group("fraction")
-    if fraction is not None:
-        formatted += f".{fraction}"
+    original_fraction = time_match.group("fraction")
+    if original_fraction is not None:
+        formatted += "." + fit_fraction_to_precision(
+            fraction,
+            local_datetime.microsecond,
+            len(original_fraction),
+        )
 
     timezone_text = time_match.group("timezone")
     if offset_minutes is not None:
@@ -667,27 +715,11 @@ def timezone_states_for_local_time(local_datetime, classification_timezone):
 
 
 def derive_utc_offset_from_timestamp_pair(local_datetime, utc_datetime):
-    """
-    Derive a plausible civil offset from matching local and UTC timestamps.
-
-    Day adjustments handle midnight crossings. Whole-minute rounding tolerates
-    up to five seconds because telemetry and exposure clocks may not be sampled
-    simultaneously. Results are limited to civil offsets UTC-12 through UTC+14.
-    """
-    raw_seconds = (local_datetime - utc_datetime).total_seconds()
-    for day_adjustment in (0, -1, 1, -2, 2):
-        adjusted_seconds = raw_seconds + day_adjustment * 86400
-        rounded_minutes = int(round(adjusted_seconds / 60))
-        residual_seconds = abs(adjusted_seconds - rounded_minutes * 60)
-        if -12 * 60 <= rounded_minutes <= 14 * 60 and residual_seconds <= 5:
-            return rounded_minutes
+    """Derive a whole-minute civil offset from complete local and UTC values."""
+    rounded_minutes = int(round((local_datetime - utc_datetime).total_seconds() / 60))
+    if -12 * 60 <= rounded_minutes <= 14 * 60:
+        return rounded_minutes
     return None
-
-
-def resolve_unambiguous_timezone_state(local_datetime, classification_timezone):
-    """Return the sole valid timezone state for a local time, or None."""
-    states = timezone_states_for_local_time(local_datetime, classification_timezone)
-    return states[0] if len(states) == 1 else None
 
 
 def format_labels_by_file(records):
@@ -844,6 +876,8 @@ def read_related_files_metadata(metadata_reader, primary_stem, related_files):
             "capture_candidates": [],
             "timezone_context": [],
             "utc_references": [],
+            "invalid_capture_records": [],
+            "warnings": [],
             "is_image": extension_is_image,
             "is_video": extension_is_video,
             "is_capture_media": extension_is_image or extension_is_video,
@@ -924,7 +958,25 @@ def read_related_files_metadata(metadata_reader, primary_stem, related_files):
             try:
                 parsed = parse_metadata_datetime(raw_value)
             except ValueError:
+                invalid_kind = None
+                if COMPLETE_DATE_TIME_PATTERN.fullmatch(str(raw_value).strip()):
+                    invalid_kind = "datetime"
+                elif DATE_ONLY_PATTERN.fullmatch(str(raw_value).strip()):
+                    invalid_kind = "date"
+                elif TIME_ONLY_PATTERN.fullmatch(str(raw_value).strip()):
+                    invalid_kind = "time"
                 invalid_capture_values.append(f"{metadata_key}={raw_value!r}")
+                if invalid_kind is not None:
+                    file_record["invalid_capture_records"].append(
+                        {
+                            "metadata_key": metadata_key,
+                            "groups": groups,
+                            "tag_name": tag_name,
+                            "raw_value": raw_value,
+                            "kind": invalid_kind,
+                            "repair_approved": False,
+                        }
+                    )
                 continue
             if parsed is None:
                 continue
@@ -938,7 +990,9 @@ def read_related_files_metadata(metadata_reader, primary_stem, related_files):
                         "date_type": 1,
                         "datetime": parsed.local_datetime,
                         "source": metadata_key,
+                        "tag_name": tag_name,
                         "offset_minutes": parsed.utc_offset_minutes,
+                        "fraction": parsed.fraction,
                         "kind": (
                             "composite"
                             if groups and groups[0] == "Composite"
@@ -955,11 +1009,10 @@ def read_related_files_metadata(metadata_reader, primary_stem, related_files):
             file_record["is_image"] or file_record["is_video"]
         )
 
-        if invalid_capture_values and file_record["is_capture_media"]:
-            related_files_metadata["review_reasons"][source_file] = (
-                "invalid capture metadata date: " + "; ".join(invalid_capture_values)
+        if invalid_capture_values:
+            file_record["warnings"].append(
+                "invalid capture metadata: " + "; ".join(invalid_capture_values)
             )
-            continue
 
         # --------------------------------------------------------------------
         # READ THE NARROWLY SCOPED FILEMODIFYDATE CONSENSUS CANDIDATE
@@ -1019,7 +1072,9 @@ def read_related_files_metadata(metadata_reader, primary_stem, related_files):
                                 "date_type": 0,
                                 "datetime": parsed_modify.local_datetime,
                                 "source": "File:System:FileModifyDate",
+                                "tag_name": "FileModifyDate",
                                 "offset_minutes": None,
+                                "fraction": parsed_modify.fraction,
                                 "kind": "file_modify",
                             }
                         )
@@ -1039,156 +1094,285 @@ def read_related_files_metadata(metadata_reader, primary_stem, related_files):
 
 def determine_capture_time_consensus(related_files, related_files_metadata):
     """
-    Merge complete candidates and establish one authoritative capture time.
+    Establish one capture-time choice from timestamp, offset, and DST evidence.
 
-    Candidate values are grouped into threshold-bounded options. Every value in
-    one option must fall within ``CAPTURE_TIME_CONFLICT_THRESHOLD_SECONDS`` of
-    that option's earliest timestamp; comparing only adjacent values would allow
-    a chain of small differences to hide a much larger overall disagreement.
-
-    Each option retains all sources and explicit embedded offsets. Filesystem
-    offsets are discarded: FileModifyDate may contribute its local wall-clock
-    value, but it cannot act as camera timezone/DST evidence, alter remembered
-    correction signatures, or disambiguate a DST fold.
-
-    The exact representative is the existing timestamp supported by the most
-    distinct sources, then by the most embedded-metadata sources, then the earliest
-    value. One option is accepted silently; multiple options require a user choice.
-    Incomplete components do not participate—ExifTool's complete Composite value
-    represents known combined fields.
+    Timestamps remain exact—including parsed subseconds—while the configured
+    threshold decides whether nearby values may share one temporal option. Two
+    otherwise-close values are separate choices when their explicit UTC offsets
+    or DST states differ. Missing state is treated as unknown rather than a
+    contradiction, so a naive sidecar or FileModifyDate may support any compatible
+    explicit state but cannot erase a genuine metadata conflict.
     """
-    candidates_by_file = {}
+    primary_capture_media = set(related_files_metadata["primary_capture_media"])
+    candidate_variants = []
 
     for source_file, file_record in related_files_metadata["files"].items():
-        candidates = list(file_record["capture_candidates"])
-        if candidates:
-            candidates_by_file[source_file] = candidates
+        values_by_tag = {}
+        for source_name, tag_name, raw_value in file_record["timezone_context"]:
+            values_by_tag.setdefault(tag_name, []).append((source_name, raw_value))
 
-    # ------------------------------------------------------------------------
-    # SORT ALL COMPLETE CANDIDATES AND BUILD THRESHOLD-BOUNDED CLUSTERS
-    #
-    # A new cluster begins only when the candidate is more than the configured
-    # threshold after the current cluster's earliest value. The earliest-to-
-    # latest span therefore remains bounded even when neighboring timestamps are
-    # each close enough to form a misleading chain.
-    # ------------------------------------------------------------------------
-    sorted_candidate_records = sorted(
-        (
-            (candidate["datetime"], source_file, candidate)
-            for source_file, candidates in candidates_by_file.items()
-            for candidate in candidates
-        ),
-        key=lambda record: (
-            record[0],
-            record[1].name.casefold(),
-            str(record[2]["source"]).casefold(),
-        ),
-    )
+        global_offset_records = []
+        dst_records = []
+        if source_file in primary_capture_media:
+            for tag_name in GLOBAL_OFFSET_TAGS:
+                for source_name, raw_value in values_by_tag.get(tag_name, []):
+                    offset_minutes = parse_metadata_offset_minutes(tag_name, raw_value)
+                    if offset_minutes is not None:
+                        global_offset_records.append(
+                            (
+                                source_file,
+                                source_name,
+                                str(raw_value).strip(),
+                                offset_minutes,
+                                "metadata offset",
+                            )
+                        )
 
-    consensus_clusters = []
-    current_cluster = []
-    current_cluster_start = None
+            for source_name, raw_value in values_by_tag.get("DaylightSavings", []):
+                state = parse_daylight_saving_value(raw_value)
+                if state is not None:
+                    dst_records.append((source_file, source_name, state))
 
-    for candidate_record in sorted_candidate_records:
-        candidate_datetime = candidate_record[0]
-        if (
-            current_cluster
-            and (candidate_datetime - current_cluster_start).total_seconds()
-            > CAPTURE_TIME_CONFLICT_THRESHOLD_SECONDS
-        ):
-            consensus_clusters.append(current_cluster)
-            current_cluster = []
-            current_cluster_start = None
+            for _, _, active_dst_tag, _ in resolve_active_timezone_profiles(
+                values_by_tag
+            ):
+                for source_name, raw_value in values_by_tag.get(active_dst_tag, []):
+                    state = parse_daylight_saving_value(raw_value)
+                    if state is not None:
+                        dst_records.append((source_file, source_name, state))
 
-        if not current_cluster:
-            current_cluster_start = candidate_datetime
-        current_cluster.append(candidate_record)
+        global_offset_records = list(dict.fromkeys(global_offset_records))
+        dst_records = list(dict.fromkeys(dst_records))
 
-    if current_cluster:
-        consensus_clusters.append(current_cluster)
-
-    # ------------------------------------------------------------------------
-    # BUILD ONE DISPLAY/DECISION OPTION FOR EACH THRESHOLD CLUSTER
-    #
-    # The representative must be a timestamp that actually exists in metadata.
-    # Independent files count first; multiple synonymous or Composite paths from
-    # one file do not create extra votes. Embedded metadata then outranks a
-    # FileModifyDate-only value, direct complete fields outrank calculated Composite
-    # values, and the earliest timestamp resolves the final deterministic tie.
-    #
-    # Only embedded offsets are retained. Even if a future read path accidentally
-    # attaches an offset to a FileModifyDate candidate, this consensus boundary
-    # rejects it so filesystem state cannot enter camera timezone/DST analysis.
-    # METADATA still outranks OS_DATE only for the descriptive DATETYPE label.
-    # ------------------------------------------------------------------------
-    consensus_options = {}
-    for cluster in consensus_clusters:
-        records_by_exact_datetime = {}
-        for candidate_datetime, source_file, candidate in cluster:
-            records_by_exact_datetime.setdefault(candidate_datetime, []).append(
-                (source_file, candidate)
-            )
-
-        representative_datetime = min(
-            records_by_exact_datetime,
-            key=lambda candidate_datetime: (
-                -len(
-                    {
-                        source_file
-                        for source_file, _ in records_by_exact_datetime[
-                            candidate_datetime
-                        ]
-                    }
-                ),
-                -len(
-                    {
-                        source_file
-                        for source_file, candidate in records_by_exact_datetime[
-                            candidate_datetime
-                        ]
-                        if candidate["kind"] != "file_modify"
-                    }
-                ),
-                -len(
-                    {
-                        source_file
-                        for source_file, candidate in records_by_exact_datetime[
-                            candidate_datetime
-                        ]
-                        if candidate["kind"] == "complete"
-                    }
-                ),
-                candidate_datetime,
-            ),
-        )
-
-        option = {
-            "date_type": max(record[2]["date_type"] for record in cluster),
-            "sources": [],
-            "offset_records": [],
-            "member_datetimes": set(records_by_exact_datetime),
-            "earliest_datetime": cluster[0][0],
-            "latest_datetime": cluster[-1][0],
-        }
-
-        for candidate_datetime, source_file, candidate in cluster:
-            option["sources"].append((source_file, candidate["source"]))
+        for candidate in file_record["capture_candidates"]:
+            candidate_offset_records = []
             if (
                 candidate["kind"] != "file_modify"
                 and candidate["offset_minutes"] is not None
             ):
-                offset_record = (
-                    source_file,
-                    candidate["source"],
-                    candidate["offset_minutes"],
+                candidate_offset_records.append(
+                    (
+                        source_file,
+                        candidate["source"],
+                        "UTC" + format_offset(candidate["offset_minutes"]),
+                        candidate["offset_minutes"],
+                        "timestamp offset",
+                    )
                 )
-                if offset_record not in option["offset_records"]:
-                    option["offset_records"].append(offset_record)
 
-        consensus_options[representative_datetime] = option
+            associated_offset_tag = ASSOCIATED_OFFSET_TAGS.get(candidate["tag_name"])
+            if associated_offset_tag is not None:
+                for source_name, raw_value in values_by_tag.get(
+                    associated_offset_tag,
+                    [],
+                ):
+                    offset_minutes = parse_metadata_offset_minutes(
+                        associated_offset_tag,
+                        raw_value,
+                    )
+                    if offset_minutes is not None:
+                        candidate_offset_records.append(
+                            (
+                                source_file,
+                                source_name,
+                                str(raw_value).strip(),
+                                offset_minutes,
+                                "associated timestamp offset",
+                            )
+                        )
 
-    # No complete candidate means review. The script never invents a timestamp
-    # from an incomplete component or an unrelated system field.
+            if source_file in primary_capture_media:
+                candidate_offset_records.extend(global_offset_records)
+                for source_name, utc_datetime in file_record["utc_references"]:
+                    derived_offset = derive_utc_offset_from_timestamp_pair(
+                        candidate["datetime"],
+                        utc_datetime,
+                    )
+                    if derived_offset is not None:
+                        candidate_offset_records.append(
+                            (
+                                source_file,
+                                source_name,
+                                utc_datetime.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                                derived_offset,
+                                "UTC counterpart",
+                            )
+                        )
+
+            candidate_offset_records = list(dict.fromkeys(candidate_offset_records))
+            offset_choices = sorted(
+                {record[3] for record in candidate_offset_records}
+            ) or [None]
+            dst_choices = sorted({record[2] for record in dst_records}) or [None]
+
+            for offset_minutes in offset_choices:
+                for dst_state in dst_choices:
+                    candidate_variants.append(
+                        {
+                            **candidate,
+                            "source_file": source_file,
+                            "time_value": capture_time_value(
+                                candidate["datetime"],
+                                candidate.get("fraction"),
+                            ),
+                            "state_offset_minutes": offset_minutes,
+                            "state_dst": dst_state,
+                            "offset_records": [
+                                record
+                                for record in candidate_offset_records
+                                if record[3] == offset_minutes
+                            ],
+                            "dst_records": [
+                                record
+                                for record in dst_records
+                                if record[2] == dst_state
+                            ],
+                        }
+                    )
+
+    sorted_variants = sorted(
+        candidate_variants,
+        key=lambda variant: (
+            variant["time_value"],
+            variant["source_file"].name.casefold(),
+            str(variant["source"]).casefold(),
+            (
+                variant["state_offset_minutes"]
+                if variant["state_offset_minutes"] is not None
+                else 10**9
+            ),
+            variant["state_dst"] if variant["state_dst"] is not None else 2,
+        ),
+    )
+
+    temporal_clusters = []
+    current_cluster = []
+    current_cluster_start = None
+    for variant in sorted_variants:
+        if current_cluster and variant["time_value"] - current_cluster_start > Decimal(
+            CAPTURE_TIME_CONFLICT_THRESHOLD_SECONDS
+        ):
+            temporal_clusters.append(current_cluster)
+            current_cluster = []
+            current_cluster_start = None
+        if not current_cluster:
+            current_cluster_start = variant["time_value"]
+        current_cluster.append(variant)
+    if current_cluster:
+        temporal_clusters.append(current_cluster)
+
+    consensus_options = []
+    kind_priority = {"complete": 0, "composite": 1, "file_modify": 2}
+    for temporal_cluster in temporal_clusters:
+        offset_choices = sorted(
+            {
+                variant["state_offset_minutes"]
+                for variant in temporal_cluster
+                if variant["state_offset_minutes"] is not None
+            }
+        ) or [None]
+        dst_choices = sorted(
+            {
+                variant["state_dst"]
+                for variant in temporal_cluster
+                if variant["state_dst"] is not None
+            }
+        ) or [None]
+
+        for offset_minutes in offset_choices:
+            for dst_state in dst_choices:
+                compatible_variants = [
+                    variant
+                    for variant in temporal_cluster
+                    if (
+                        variant["state_offset_minutes"] is None
+                        or variant["state_offset_minutes"] == offset_minutes
+                    )
+                    and (
+                        variant["state_dst"] is None
+                        or variant["state_dst"] == dst_state
+                    )
+                ]
+                if not compatible_variants:
+                    continue
+
+                records_by_exact_time = {}
+                for variant in compatible_variants:
+                    records_by_exact_time.setdefault(
+                        variant["time_value"],
+                        [],
+                    ).append(variant)
+
+                representative_time = min(
+                    records_by_exact_time,
+                    key=lambda candidate_time: (
+                        -len(
+                            {
+                                variant["source_file"]
+                                for variant in records_by_exact_time[candidate_time]
+                            }
+                        ),
+                        -len(
+                            {
+                                variant["source_file"]
+                                for variant in records_by_exact_time[candidate_time]
+                                if variant["kind"] != "file_modify"
+                            }
+                        ),
+                        -len(
+                            {
+                                variant["source_file"]
+                                for variant in records_by_exact_time[candidate_time]
+                                if variant["kind"] == "complete"
+                            }
+                        ),
+                        candidate_time,
+                    ),
+                )
+                representative_variant = min(
+                    records_by_exact_time[representative_time],
+                    key=lambda variant: (
+                        kind_priority[variant["kind"]],
+                        variant["source_file"].name.casefold(),
+                        str(variant["source"]).casefold(),
+                        variant.get("fraction") or "",
+                    ),
+                )
+                representative_datetime = representative_variant["datetime"]
+
+                option = {
+                    "datetime": representative_datetime,
+                    "fraction": representative_variant.get("fraction"),
+                    "date_type": max(
+                        variant["date_type"] for variant in compatible_variants
+                    ),
+                    "offset_minutes": offset_minutes,
+                    "dst_state": dst_state,
+                    "sources": [],
+                    "offset_records": [],
+                    "dst_records": [],
+                    "earliest_time_value": min(
+                        variant["time_value"] for variant in compatible_variants
+                    ),
+                    "latest_time_value": max(
+                        variant["time_value"] for variant in compatible_variants
+                    ),
+                }
+                for variant in compatible_variants:
+                    source_record = (
+                        variant["source_file"],
+                        variant["source"],
+                    )
+                    if source_record not in option["sources"]:
+                        option["sources"].append(source_record)
+                    for record in variant["offset_records"]:
+                        if record not in option["offset_records"]:
+                            option["offset_records"].append(record)
+                    for record in variant["dst_records"]:
+                        if record not in option["dst_records"]:
+                            option["dst_records"].append(record)
+                consensus_options.append(option)
+
     if not consensus_options:
         for source_file in related_files_metadata["usable_files"]:
             related_files_metadata["review_reasons"].setdefault(
@@ -1197,42 +1381,46 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
             )
         return {
             "datetime": None,
+            "fraction": None,
             "date_type": None,
             "offset_records": [],
+            "dst_records": [],
+            "selected_dst_state": None,
             "preserve_timezone_metadata": False,
             "preferred_utc_offset_minutes": None,
         }
 
-    # ------------------------------------------------------------------------
-    # ACCEPT ONE THRESHOLD CLUSTER OR ASK THE USER TO RESOLVE MULTIPLE CLUSTERS
-    # ------------------------------------------------------------------------
-    if len(consensus_options) == 1:
-        selected_datetime, selected_option = next(iter(consensus_options.items()))
+    sorted_options = sorted(
+        consensus_options,
+        key=lambda option: (
+            option["datetime"],
+            option["offset_minutes"] if option["offset_minutes"] is not None else 10**9,
+            option["dst_state"] if option["dst_state"] is not None else 2,
+        ),
+    )
+    if len(sorted_options) == 1:
+        selected_option = sorted_options[0]
     else:
-        sorted_options = sorted(consensus_options.items())
         print()
-        print("Conflicting capture dates found for these related files:")
+        print("Conflicting capture date/time states found for these related files:")
         for source_file in related_files:
             print(f"  - {source_file.name}")
-        print("Choose the date/time that should be used:")
-        for option_number, (candidate_datetime, option) in enumerate(
-            sorted_options,
-            start=1,
-        ):
-            cluster_span_seconds = int(
-                (
-                    option["latest_datetime"] - option["earliest_datetime"]
-                ).total_seconds()
-            )
+        print("Choose the date/time, UTC offset, and DST state that should be used:")
+        for option_number, option in enumerate(sorted_options, start=1):
+            state_labels = []
+            if option["offset_minutes"] is not None:
+                state_labels.append("UTC" + format_offset(option["offset_minutes"]))
+            if option["dst_state"] is not None:
+                state_labels.append("DST " + ("ON" if option["dst_state"] else "OFF"))
+            state_text = " " + ", ".join(state_labels) if state_labels else ""
+            cluster_span = option["latest_time_value"] - option["earliest_time_value"]
             tolerance_label = (
-                ""
-                if cluster_span_seconds == 0
-                else f"; source span {cluster_span_seconds}s"
+                "" if cluster_span == 0 else f"; source span {cluster_span:g}s"
             )
             print(
                 f"  {option_number}. "
-                f"{candidate_datetime.strftime('%Y-%m-%d %H:%M:%S')} - "
-                f"{format_labels_by_file(option['sources'])}"
+                f"{format_consensus_datetime(option['datetime'], option['fraction'])}"
+                f"{state_text} - {format_labels_by_file(option['sources'])}"
                 f"{tolerance_label}"
             )
 
@@ -1246,34 +1434,66 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
                 print("Invalid selection. Enter one of the listed numbers.")
                 continue
             if 1 <= selected_number <= len(sorted_options):
-                selected_datetime, selected_option = sorted_options[selected_number - 1]
+                selected_option = sorted_options[selected_number - 1]
                 print(
-                    "Selected capture time: "
-                    f"{selected_datetime.strftime('%Y-%m-%d %H:%M:%S')}"
+                    "Selected capture state: "
+                    + format_consensus_datetime(
+                        selected_option["datetime"],
+                        selected_option["fraction"],
+                    )
                 )
                 print()
                 break
             print("Invalid selection. Enter one of the listed numbers.")
 
-    # A unique embedded offset attached anywhere in the chosen cluster is retained
-    # as the preferred interpretation of an ambiguous autumn fold and as the
-    # absolute basis for the FileModifyDate written to copied media. Filesystem
-    # offsets were discarded before this point. Conflicting or absent embedded
-    # offsets deliberately leave the preference unset so timezone-database
-    # ambiguity is not hidden.
-    selected_offsets = {
-        record[2] for record in selected_option.get("offset_records", [])
-    }
-    preferred_offset = (
-        next(iter(selected_offsets)) if len(selected_offsets) == 1 else None
-    )
+    for source_file in related_files:
+        file_record = related_files_metadata["files"].get(source_file)
+        if file_record is None or not file_record["invalid_capture_records"]:
+            continue
+        print(f"Warning: '{source_file.name}' contains invalid capture metadata:")
+        for invalid_record in file_record["invalid_capture_records"]:
+            print(
+                f"  - {invalid_record['metadata_key']}="
+                f"{invalid_record['raw_value']!r}"
+            )
+        writable_records = [
+            invalid_record
+            for invalid_record in file_record["invalid_capture_records"]
+            if get_metadata_write_target(
+                invalid_record["groups"],
+                invalid_record["tag_name"],
+            )
+            is not None
+        ]
+        if not writable_records:
+            print("  No invalid field has a writable ExifTool target.")
+            continue
+        while True:
+            repair_selection = (
+                input(
+                    "Repair the writable invalid field(s) in the classified copy "
+                    "using the selected capture state? [y/N]: "
+                )
+                .strip()
+                .casefold()
+            )
+            if repair_selection in {"", "n", "no"}:
+                break
+            if repair_selection in {"y", "yes"}:
+                for invalid_record in writable_records:
+                    invalid_record["repair_approved"] = True
+                break
+            print("Invalid selection. Enter y or n.")
 
     return {
-        "datetime": selected_datetime,
+        "datetime": selected_option["datetime"],
+        "fraction": selected_option["fraction"],
         "date_type": selected_option["date_type"],
         "offset_records": selected_option["offset_records"],
+        "dst_records": selected_option["dst_records"],
+        "selected_dst_state": selected_option["dst_state"],
         "preserve_timezone_metadata": False,
-        "preferred_utc_offset_minutes": preferred_offset,
+        "preferred_utc_offset_minutes": selected_option["offset_minutes"],
     }
 
 
@@ -1311,39 +1531,14 @@ def review_and_correct_timezone_and_dst(
         classification_timezone,
     )
 
-    dst_records = []
-    offset_records = []
+    dst_records = list(capture_time_consensus.get("dst_records", []))
+    offset_records = list(capture_time_consensus.get("offset_records", []))
     display_records = []
 
-    # ------------------------------------------------------------------------
-    # OFFSETS ATTACHED DIRECTLY TO THE SELECTED CONSENSUS VALUE
-    #
-    # These are the strongest offset evidence because they belong to the exact
-    # timestamp the user selected. They may legitimately originate in a writable
-    # XMP sidecar that supplied the selected value.
-    # ------------------------------------------------------------------------
-    for source_file, source_name, offset_minutes in capture_time_consensus.get(
-        "offset_records",
-        [],
-    ):
-        offset_records.append(
-            (
-                source_file,
-                source_name,
-                "UTC" + format_offset(offset_minutes),
-                offset_minutes,
-                "timestamp offset",
-            )
-        )
-
-    # ------------------------------------------------------------------------
-    # CAMERA CONFIGURATION AND UTC REFERENCES FROM PRIMARY CAPTURE MEDIA
-    #
-    # Camera settings and UTC counterparts are restricted to exact-primary-stem
-    # image/video files. Sidecars and derivative media may carry useful capture
-    # timestamps, but they cannot define what the original camera was configured
-    # to do. Their copied settings may still be normalized after consensus.
-    # ------------------------------------------------------------------------
+    # Offset and DST conflicts were resolved with the capture-time choice. This
+    # phase therefore consumes only the selected option's complete evidence
+    # environment. Primary-media context is reread here only for explanatory
+    # city/profile labels, not to reintroduce rejected state alternatives.
     for source_file in related_files_metadata["primary_capture_media"]:
         file_record = related_files_metadata["files"].get(source_file)
         if file_record is None:
@@ -1353,22 +1548,12 @@ def review_and_correct_timezone_and_dst(
         for source_name, tag_name, raw_value in file_record["timezone_context"]:
             values_by_tag.setdefault(tag_name, []).append((source_name, raw_value))
 
-        for source_name, raw_value in values_by_tag.get("DaylightSavings", []):
-            state = parse_daylight_saving_value(raw_value)
-            if state is not None:
-                dst_records.append((source_file, source_name, state))
-
         for (
             selector_tag,
             active_profile,
-            active_dst_tag,
+            _,
             context_tags,
         ) in resolve_active_timezone_profiles(values_by_tag):
-            for source_name, raw_value in values_by_tag.get(active_dst_tag, []):
-                state = parse_daylight_saving_value(raw_value)
-                if state is not None:
-                    dst_records.append((source_file, source_name, state))
-
             for context_tag in context_tags:
                 for source_name, raw_value in values_by_tag.get(context_tag, []):
                     display_records.append(
@@ -1388,36 +1573,6 @@ def review_and_correct_timezone_and_dst(
         for tag_name in ("TimeZoneCity", "TimeZone"):
             for source_name, raw_value in values_by_tag.get(tag_name, []):
                 display_records.append((source_file, f"{source_name}={raw_value}"))
-
-        for tag_name in OFFSET_CONTEXT_TAGS:
-            for source_name, raw_value in values_by_tag.get(tag_name, []):
-                offset_minutes = parse_metadata_offset_minutes(tag_name, raw_value)
-                if offset_minutes is not None:
-                    offset_records.append(
-                        (
-                            source_file,
-                            source_name,
-                            str(raw_value).strip(),
-                            offset_minutes,
-                            "metadata offset",
-                        )
-                    )
-
-        for source_name, utc_datetime in file_record["utc_references"]:
-            derived_offset = derive_utc_offset_from_timestamp_pair(
-                selected_datetime,
-                utc_datetime,
-            )
-            if derived_offset is not None:
-                offset_records.append(
-                    (
-                        source_file,
-                        source_name,
-                        utc_datetime.strftime("%Y-%m-%d %H:%M:%S UTC"),
-                        derived_offset,
-                        "UTC counterpart",
-                    )
-                )
 
     # Collapse repeated telemetry without losing distinct filenames or source
     # tags. The full tuples are deduplicated, so identical values from different
@@ -1446,7 +1601,12 @@ def review_and_correct_timezone_and_dst(
     print()
     print("Timezone/daylight-saving review for these related files:")
     print(f"  Assumed timezone: {timezone_name}")
-    print(f"  Selected local time: {selected_datetime:%Y-%m-%d %H:%M:%S}")
+    print(
+        "  Selected local time: "
+        + format_consensus_datetime(
+            selected_datetime, capture_time_consensus.get("fraction")
+        )
+    )
 
     if valid_states:
         expected_text = ", ".join(
@@ -1630,7 +1790,7 @@ def review_and_correct_timezone_and_dst(
         print(
             "  Automatically applying the previously approved matching "
             f"correction ({signed_hours:+g} {hour_unit}): "
-            f"{corrected_datetime:%Y-%m-%d %H:%M:%S}"
+            f"{format_consensus_datetime(corrected_datetime, capture_time_consensus.get('fraction'))}"
         )
         print()
         capture_time_consensus["datetime"] = corrected_datetime
@@ -1639,14 +1799,19 @@ def review_and_correct_timezone_and_dst(
         return
 
     print("Choose how these files should be classified:")
-    print(f"  1. Keep {selected_datetime:%Y-%m-%d %H:%M:%S}")
+    print(
+        "  1. Keep "
+        + format_consensus_datetime(
+            selected_datetime, capture_time_consensus.get("fraction")
+        )
+    )
     for option_number, (corrected_datetime, reasons) in enumerate(
         correction_options,
         start=2,
     ):
         print(
             f"  {option_number}. Correct to "
-            f"{corrected_datetime:%Y-%m-%d %H:%M:%S} "
+            f"{format_consensus_datetime(corrected_datetime, capture_time_consensus.get('fraction'))} "
             f"({'; '.join(reasons)})"
         )
 
@@ -1763,59 +1928,6 @@ def format_metadata_offset_value(tag_name, original_value, offset_minutes):
     return replacement
 
 
-def operation_matches(operation, actual_values):
-    """
-    Compare read-back values semantically rather than textually.
-
-    ExifTool may normalize separators, raw encodings, or numeric formatting, so
-    verification reparses timestamps, offsets, and DST states.
-    """
-    expected = operation["expected"]
-    for actual_value in actual_values:
-        try:
-            if operation["kind"] == "datetime":
-                parsed = parse_metadata_datetime(actual_value)
-                if (
-                    parsed is not None
-                    and (
-                        parsed.local_datetime,
-                        parsed.utc_offset_minutes,
-                    )
-                    == expected
-                ):
-                    return True
-            elif operation["kind"] == "date":
-                parsed = parse_metadata_datetime(actual_value)
-                if parsed is not None and parsed.local_date == expected:
-                    return True
-            elif operation["kind"] == "time":
-                parsed = parse_metadata_datetime(actual_value)
-                if (
-                    parsed is not None
-                    and (
-                        parsed.local_time,
-                        parsed.utc_offset_minutes,
-                    )
-                    == expected
-                ):
-                    return True
-            elif operation["kind"] == "offset":
-                if (
-                    parse_metadata_offset_minutes(
-                        operation["tag_name"],
-                        actual_value,
-                    )
-                    == expected
-                ):
-                    return True
-            elif operation["kind"] == "dst":
-                if parse_daylight_saving_value(actual_value) == expected:
-                    return True
-        except (TypeError, ValueError):
-            continue
-    return False
-
-
 # ============================================================================
 # MAJOR OPERATION 4 SUPPORT: UPDATE A NEWLY CREATED CLASSIFIED COPY
 # ============================================================================
@@ -1852,6 +1964,7 @@ def update_copied_file_metadata_and_system_times(
     selected_datetime = capture_time_consensus["datetime"]
     if selected_datetime is None:
         return [], []
+    selected_fraction = capture_time_consensus.get("fraction")
 
     operations = {}
     skipped = set()
@@ -1888,6 +2001,95 @@ def update_copied_file_metadata_and_system_times(
         values_by_tag.setdefault(tag_name, []).append((metadata_key, groups, raw_value))
 
     # ------------------------------------------------------------------------
+    # REPAIR USER-APPROVED INVALID CAPTURE FIELDS
+    #
+    # Invalid syntax is never rewritten automatically. After explicit approval,
+    # the existing field representation is replaced with the selected capture
+    # value; no missing field is created. Read-only targets remain warnings only.
+    # ------------------------------------------------------------------------
+    approved_invalid_targets = set()
+    for invalid_record in file_record.get("invalid_capture_records", []):
+        if not invalid_record.get("repair_approved"):
+            continue
+        write_target = get_metadata_write_target(
+            invalid_record["groups"],
+            invalid_record["tag_name"],
+        )
+        if write_target is None:
+            continue
+
+        raw_value = invalid_record["raw_value"]
+        try:
+            if invalid_record["kind"] == "datetime":
+                match = COMPLETE_DATE_TIME_PATTERN.fullmatch(str(raw_value).strip())
+                has_inline_offset = (
+                    match is not None and match.group("timezone") is not None
+                )
+                target_offset = expected_offset if has_inline_offset else None
+                if has_inline_offset and target_offset is None:
+                    skipped.add(
+                        f"{invalid_record['metadata_key']} "
+                        "(ambiguous consensus UTC offset)"
+                    )
+                    continue
+                expected_text = format_complete_datetime(
+                    raw_value,
+                    selected_datetime,
+                    target_offset,
+                    selected_fraction,
+                )
+                expected_parsed = parse_metadata_datetime(expected_text)
+                expected = (
+                    expected_parsed.local_datetime,
+                    expected_parsed.utc_offset_minutes,
+                )
+            elif invalid_record["kind"] == "date":
+                expected_text = format_date_only(raw_value, selected_datetime)
+                expected = selected_datetime.date()
+            else:
+                match = TIME_ONLY_PATTERN.fullmatch(str(raw_value).strip())
+                has_inline_offset = (
+                    match is not None and match.group("timezone") is not None
+                )
+                target_offset = expected_offset if has_inline_offset else None
+                if has_inline_offset and target_offset is None:
+                    skipped.add(
+                        f"{invalid_record['metadata_key']} "
+                        "(ambiguous consensus UTC offset)"
+                    )
+                    continue
+                expected_text = format_time_only(
+                    raw_value,
+                    selected_datetime,
+                    target_offset,
+                    selected_fraction,
+                )
+                expected_parsed = parse_metadata_datetime(expected_text)
+                expected = (
+                    expected_parsed.local_time,
+                    expected_parsed.utc_offset_minutes,
+                )
+        except (TypeError, ValueError):
+            skipped.add(
+                f"{invalid_record['metadata_key']} "
+                "(could not format approved invalid timestamp)"
+            )
+            continue
+
+        approved_invalid_targets.add(write_target.removesuffix("#"))
+        add_correction_operation(
+            operations,
+            skipped,
+            {
+                "target": write_target,
+                "value": expected_text,
+                "kind": invalid_record["kind"],
+                "expected": expected,
+                "tag_name": invalid_record["tag_name"],
+            },
+        )
+
+    # ------------------------------------------------------------------------
     # ALIGN EVERY WRITABLE ELIGIBLE COMPLETE CAPTURE TIMESTAMP TO CONSENSUS
     #
     # Rejected values and other eligible local capture fields all receive the
@@ -1914,7 +2116,8 @@ def update_copied_file_metadata_and_system_times(
         try:
             parsed = parse_metadata_datetime(raw_value)
         except ValueError:
-            skipped.add(f"{metadata_key} (invalid capture timestamp)")
+            if write_target not in approved_invalid_targets:
+                skipped.add(f"{metadata_key} (invalid capture timestamp)")
             continue
         if parsed is None or parsed.local_datetime is None:
             continue
@@ -1933,12 +2136,17 @@ def update_copied_file_metadata_and_system_times(
             raw_value,
             selected_datetime,
             target_offset,
+            selected_fraction,
         )
-        expected_value = (selected_datetime, target_offset)
+        expected_parsed = parse_metadata_datetime(expected_text)
+        expected_value = (
+            expected_parsed.local_datetime,
+            expected_parsed.utc_offset_minutes,
+        )
         if (
-            parsed.local_datetime == selected_datetime
-            and parsed.utc_offset_minutes == target_offset
-        ):
+            parsed.local_datetime,
+            parsed.utc_offset_minutes,
+        ) == expected_value:
             continue
 
         add_correction_operation(
@@ -2009,25 +2217,35 @@ def update_copied_file_metadata_and_system_times(
             if parsed.utc_offset_minutes is not None and target_offset is None:
                 skipped.add(f"{metadata_key} (ambiguous consensus UTC offset)")
                 continue
+
+            expected_text = format_time_only(
+                raw_value,
+                selected_datetime,
+                target_offset,
+                selected_fraction,
+            )
+            expected_parsed = parse_metadata_datetime(expected_text)
+            expected_value = (
+                expected_parsed.local_time,
+                expected_parsed.utc_offset_minutes,
+            )
             if (
-                parsed.local_time != selected_datetime.time()
-                or parsed.utc_offset_minutes != target_offset
-            ):
-                add_correction_operation(
-                    operations,
-                    skipped,
-                    {
-                        "target": write_target,
-                        "value": format_time_only(
-                            raw_value,
-                            selected_datetime,
-                            target_offset,
-                        ),
-                        "kind": "time",
-                        "expected": (selected_datetime.time(), target_offset),
-                        "tag_name": tag_name,
-                    },
-                )
+                parsed.local_time,
+                parsed.utc_offset_minutes,
+            ) == expected_value:
+                continue
+
+            add_correction_operation(
+                operations,
+                skipped,
+                {
+                    "target": write_target,
+                    "value": expected_text,
+                    "kind": "time",
+                    "expected": expected_value,
+                    "tag_name": tag_name,
+                },
+            )
 
     # ------------------------------------------------------------------------
     # NORMALIZE EXISTING OFFSETS AGAINST THE FINAL CONSENSUS
@@ -2106,10 +2324,11 @@ def update_copied_file_metadata_and_system_times(
                         },
                     )
 
-            expected_state = resolve_unambiguous_timezone_state(
+            expected_states = timezone_states_for_local_time(
                 selected_datetime,
                 classification_timezone,
             )
+            expected_state = expected_states[0] if len(expected_states) == 1 else None
             if expected_state is not None:
                 expected_dst = expected_state[0]
                 dst_tags = set(DIRECT_DST_TAGS)
@@ -2226,7 +2445,52 @@ def update_copied_file_metadata_and_system_times(
 
         for operation in operation_list:
             target = operation["target"].removesuffix("#")
-            if operation_matches(operation, actual_by_target.get(target, [])):
+            matched = False
+            expected = operation["expected"]
+            # ExifTool may normalize separators, raw encodings, and numeric text.
+            # Reparse the actual value according to the operation's semantics
+            # instead of requiring byte-for-byte equality with the write argument.
+            for actual_value in actual_by_target.get(target, []):
+                try:
+                    if operation["kind"] == "datetime":
+                        parsed = parse_metadata_datetime(actual_value)
+                        matched = (
+                            parsed is not None
+                            and (
+                                parsed.local_datetime,
+                                parsed.utc_offset_minutes,
+                            )
+                            == expected
+                        )
+                    elif operation["kind"] == "date":
+                        parsed = parse_metadata_datetime(actual_value)
+                        matched = parsed is not None and parsed.local_date == expected
+                    elif operation["kind"] == "time":
+                        parsed = parse_metadata_datetime(actual_value)
+                        matched = (
+                            parsed is not None
+                            and (
+                                parsed.local_time,
+                                parsed.utc_offset_minutes,
+                            )
+                            == expected
+                        )
+                    elif operation["kind"] == "offset":
+                        matched = (
+                            parse_metadata_offset_minutes(
+                                operation["tag_name"],
+                                actual_value,
+                            )
+                            == expected
+                        )
+                    elif operation["kind"] == "dst":
+                        matched = parse_daylight_saving_value(actual_value) == expected
+                except (TypeError, ValueError):
+                    matched = False
+                if matched:
+                    break
+
+            if matched:
                 updated.append(target)
             else:
                 skipped.add(f"{target} (not writable or verification failed)")
@@ -2244,15 +2508,22 @@ def update_copied_file_metadata_and_system_times(
         if expected_offset is None:
             skipped.add("FileModifyDate (ambiguous consensus UTC offset)")
         else:
+            filesystem_fraction = selected_fraction
+            if filesystem_fraction is None and selected_datetime.microsecond:
+                filesystem_fraction = f"{selected_datetime.microsecond:06d}"
+            fraction_nanoseconds = int(
+                ((filesystem_fraction or "") + "000000000")[:9] or "0"
+            )
             aware_selected_datetime = selected_datetime.replace(
-                tzinfo=timezone(timedelta(minutes=expected_offset))
+                microsecond=0,
+                tzinfo=timezone(timedelta(minutes=expected_offset)),
             )
             selected_utc_datetime = aware_selected_datetime.astimezone(timezone.utc)
             epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
             epoch_delta = selected_utc_datetime - epoch
             selected_mtime_ns = (
                 epoch_delta.days * 86400 + epoch_delta.seconds
-            ) * 1_000_000_000 + epoch_delta.microseconds * 1000
+            ) * 1_000_000_000 + fraction_nanoseconds
             if copied_file.stat().st_mtime_ns != selected_mtime_ns:
                 os.utime(
                     copied_file,
@@ -2300,6 +2571,7 @@ def copy_related_files_to_output(
     usable_files = related_files_metadata["usable_files"]
 
     for source_file in related_files:
+        file_record = related_files_metadata["files"].get(source_file)
         if source_file in review_reasons:
             folder_name = UNCLASSIFIED_FOLDER_NAME
             destination_directory = unclassified_directory
@@ -2381,7 +2653,6 @@ def copy_related_files_to_output(
                 copied = True
 
                 if classified_copy:
-                    file_record = related_files_metadata["files"][source_file]
                     updated_targets, skipped_targets = (
                         update_copied_file_metadata_and_system_times(
                             metadata_reader,
@@ -2446,13 +2717,22 @@ def copy_related_files_to_output(
             stats["metadata_skipped"] += 1
             print("; SKIPPED: " + ", ".join(skipped_targets), end="")
 
+        warning_messages = file_record.get("warnings", []) if file_record else []
+        if warning_messages:
+            stats["warnings"] += 1
+            print("; WARNING: " + "; ".join(warning_messages), end="")
+
         if source_file in review_reasons:
             stats["review"] += 1
             print(f"; REVIEW: {review_reasons[source_file]}", end="")
         else:
             print(
-                f"; {selected_datetime:%Y-%m-%d %H:%M:%S} "
-                f"{DATETYPE[capture_time_consensus['date_type']]}",
+                "; "
+                + format_consensus_datetime(
+                    selected_datetime,
+                    capture_time_consensus.get("fraction"),
+                )
+                + f" {DATETYPE[capture_time_consensus['date_type']]}",
                 end="",
             )
         print()
@@ -2549,6 +2829,7 @@ def main():
         "failed": 0,
         "metadata_updated": 0,
         "metadata_skipped": 0,
+        "warnings": 0,
     }
     automatic_correction_rules = set()
 
@@ -2613,6 +2894,7 @@ def main():
     print(f"Renamed collision copies: {stats['renamed']}")
     print(f"Files sent for review: {stats['review']}")
     print(f"Failed files: {stats['failed']}")
+    print(f"Files with metadata warnings: {stats['warnings']}")
     print(f"Copies with corrected metadata/system time: {stats['metadata_updated']}")
     print(
         "Corrected copies with skipped/read-only fields: "
