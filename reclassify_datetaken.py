@@ -714,14 +714,6 @@ def timezone_states_for_local_time(local_datetime, classification_timezone):
     return states
 
 
-def derive_utc_offset_from_timestamp_pair(local_datetime, utc_datetime):
-    """Derive a whole-minute civil offset from complete local and UTC values."""
-    rounded_minutes = int(round((local_datetime - utc_datetime).total_seconds() / 60))
-    if -12 * 60 <= rounded_minutes <= 14 * 60:
-        return rounded_minutes
-    return None
-
-
 def format_labels_by_file(records):
     """Format evidence labels while showing each filename only once."""
     labels_by_file = {}
@@ -1184,11 +1176,15 @@ def determine_capture_time_consensus(related_files, related_files_metadata):
             if source_file in primary_capture_media:
                 candidate_offset_records.extend(global_offset_records)
                 for source_name, utc_datetime in file_record["utc_references"]:
-                    derived_offset = derive_utc_offset_from_timestamp_pair(
-                        candidate["datetime"],
-                        utc_datetime,
+                    # UTC counterparts may be sampled several seconds away from
+                    # the local capture clock. Offsets are minute-based, so drop
+                    # the leftover seconds rather than rounding them into the next
+                    # minute. ``int`` truncates toward zero for both positive and
+                    # negative differences.
+                    derived_offset = int(
+                        (candidate["datetime"] - utc_datetime).total_seconds() / 60
                     )
-                    if derived_offset is not None:
+                    if -12 * 60 <= derived_offset <= 14 * 60:
                         candidate_offset_records.append(
                             (
                                 source_file,
