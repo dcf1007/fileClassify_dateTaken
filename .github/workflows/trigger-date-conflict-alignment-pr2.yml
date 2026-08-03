@@ -1,0 +1,71 @@
+name: Apply chosen-date alignment from temporary PR
+
+on:
+  pull_request:
+    branches:
+      - agent/replace-pillow-pyexiftool
+    paths:
+      - .github/tmp/run-date-conflict-alignment-pr
+
+permissions:
+  contents: write
+
+jobs:
+  update-feature-branch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/replace-pillow-pyexiftool
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Extract and apply the prepared source patch
+        shell: bash
+        run: |
+          awk '
+            /^          python - <<.PY./ { capture = 1; next }
+            capture && /^          PY$/ { exit }
+            capture { sub(/^          /, ""); print }
+          ' .github/workflows/apply-date-conflict-alignment.yml > /tmp/apply.py
+          python /tmp/apply.py
+
+      - name: Compile and run focused regression checks
+        shell: bash
+        run: |
+          python -m pip install -r requirements.txt
+          python -m py_compile reclassify_datetaken.py
+          python - <<'PY'
+          from pathlib import Path
+
+          source = Path("reclassify_datetaken.py").read_text(encoding="utf-8")
+          required = [
+              "conflicting_date_values=None",
+              "align_to_selected = (",
+              "conflicting_date_values_by_file",
+              "or bool(conflicting_date_values)",
+          ]
+          missing = [text for text in required if text not in source]
+          if missing:
+              raise SystemExit(f"missing expected alignment code: {missing}")
+
+          readme = Path("README.md").read_text(encoding="utf-8")
+          if "classified copies are normalized to that decision" not in readme:
+              raise SystemExit("README date-conflict alignment section missing")
+          PY
+
+      - name: Commit finalized files and remove temporary automation
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm -f .github/workflows/apply-date-conflict-alignment.yml
+          git rm -f .github/workflows/trigger-date-conflict-alignment-pr.yml
+          git rm -f .github/workflows/trigger-date-conflict-alignment-pr2.yml
+          git rm -f .github/tmp/run-date-conflict-alignment
+          git add reclassify_datetaken.py README.md
+          git commit -m "Align rejected metadata dates to selected value"
+          git push origin HEAD:agent/replace-pillow-pyexiftool
