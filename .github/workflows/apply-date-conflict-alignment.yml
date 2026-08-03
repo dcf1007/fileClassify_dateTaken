@@ -1,0 +1,602 @@
+name: Apply chosen-date metadata alignment
+
+on:
+  push:
+    branches:
+      - agent/replace-pillow-pyexiftool
+    paths:
+      - .github/tmp/run-date-conflict-alignment
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/replace-pillow-pyexiftool
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Apply source and README changes
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          script_path = Path("reclassify_datetaken.py")
+          text = script_path.read_text(encoding="utf-8")
+
+          def replace_once(old, new, label):
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected one match, found {count}")
+              text = text.replace(old, new, 1)
+
+          replace_once(
+          '''def build_correction_operations(
+              source_metadata,
+              correction_delta,
+              selected_corrected_datetime,
+              classification_timezone,
+          ):
+              """Build absolute writes for local times, offsets, and writable DST flags."""
+              operations = {}
+          ''',
+          '''def build_correction_operations(
+              source_metadata,
+              correction_delta,
+              selected_corrected_datetime,
+              classification_timezone,
+              conflicting_date_values=None,
+          ):
+              """Build writes for timezone correction and chosen-date alignment."""
+              timezone_correction_active = correction_delta is not None
+              effective_correction_delta = correction_delta or timedelta(0)
+              conflicting_date_values = set(conflicting_date_values or ())
+              operations = {}
+          ''',
+          "build_correction_operations signature",
+          )
+
+          replace_once(
+          '''        if inline_offset is not None:
+                      expected_offset = get_unambiguous_timezone_offset(
+                          local_datetime,
+                          classification_timezone,
+                      )
+                      if expected_offset is None:
+                          skipped.add(f"{metadata_key} (ambiguous corrected offset)")
+                          continue
+                      expected_local = local_datetime
+                      expected_text = format_complete_datetime(
+                          raw_value,
+                          expected_local,
+                          expected_offset,
+                      )
+                      expected = (expected_local, expected_offset)
+                  elif has_separate_offset:
+                      expected_local = local_datetime
+                      corrected_local_values.setdefault(
+                          (family_zero, tag_name),
+                          [],
+                      ).append(expected_local)
+                      continue
+                  else:
+                      expected_local = local_datetime + correction_delta
+                      expected_text = format_complete_datetime(raw_value, expected_local)
+                      expected = (expected_local, None)
+          ''',
+          '''        align_to_selected = (
+                      local_datetime in conflicting_date_values
+                      and tag_name not in EXCLUDED_TIME_TAGS
+                  )
+                  if not timezone_correction_active and not align_to_selected:
+                      continue
+
+                  if align_to_selected:
+                      expected_local = selected_corrected_datetime
+                      if inline_offset is not None:
+                          expected_offset = get_unambiguous_timezone_offset(
+                              expected_local,
+                              classification_timezone,
+                          )
+                          if expected_offset is None:
+                              skipped.add(
+                                  f"{metadata_key} (ambiguous selected-date offset)"
+                              )
+                              continue
+                          expected_text = format_complete_datetime(
+                              raw_value,
+                              expected_local,
+                              expected_offset,
+                          )
+                          expected = (expected_local, expected_offset)
+                      else:
+                          expected_text = format_complete_datetime(
+                              raw_value,
+                              expected_local,
+                          )
+                          expected = (expected_local, None)
+                  elif inline_offset is not None:
+                      expected_offset = get_unambiguous_timezone_offset(
+                          local_datetime,
+                          classification_timezone,
+                      )
+                      if expected_offset is None:
+                          skipped.add(f"{metadata_key} (ambiguous corrected offset)")
+                          continue
+                      expected_local = local_datetime
+                      expected_text = format_complete_datetime(
+                          raw_value,
+                          expected_local,
+                          expected_offset,
+                      )
+                      expected = (expected_local, expected_offset)
+                  elif has_separate_offset:
+                      expected_local = local_datetime
+                      corrected_local_values.setdefault(
+                          (family_zero, tag_name),
+                          [],
+                      ).append(expected_local)
+                      continue
+                  else:
+                      expected_local = local_datetime + effective_correction_delta
+                      expected_text = format_complete_datetime(raw_value, expected_local)
+                      expected = (expected_local, None)
+          ''',
+          "complete timestamp correction logic",
+          )
+
+          replace_once(
+          '''            local_datetime, inline_offset = parsed_pair
+                      if inline_offset is None:
+                          expected_local = local_datetime + correction_delta
+                          expected_offset = None
+                      else:
+                          expected_local = local_datetime
+                          expected_offset = get_unambiguous_timezone_offset(
+                              local_datetime,
+                              classification_timezone,
+                          )
+                          if expected_offset is None:
+                              skipped.add(f"{time_key} (ambiguous corrected offset)")
+                              continue
+          ''',
+          '''            local_datetime, inline_offset = parsed_pair
+                      align_to_selected = local_datetime in conflicting_date_values
+                      if not timezone_correction_active and not align_to_selected:
+                          continue
+
+                      if align_to_selected:
+                          expected_local = selected_corrected_datetime
+                          if inline_offset is None:
+                              expected_offset = None
+                          else:
+                              expected_offset = get_unambiguous_timezone_offset(
+                                  expected_local,
+                                  classification_timezone,
+                              )
+                              if expected_offset is None:
+                                  skipped.add(
+                                      f"{time_key} (ambiguous selected-date offset)"
+                                  )
+                                  continue
+                      elif inline_offset is None:
+                          expected_local = local_datetime + effective_correction_delta
+                          expected_offset = None
+                      else:
+                          expected_local = local_datetime
+                          expected_offset = get_unambiguous_timezone_offset(
+                              local_datetime,
+                              classification_timezone,
+                          )
+                          if expected_offset is None:
+                              skipped.add(f"{time_key} (ambiguous corrected offset)")
+                              continue
+          ''',
+          "partial date/time correction logic",
+          )
+
+          replace_once(
+          '''    # FileCreateDate is shifted when the platform exposes and permits it. The
+              # cross-platform FileModifyDate fallback is handled with os.utime below.
+              for metadata_key, groups, tag_name, raw_value in records:
+                  if tag_name != "FileCreateDate":
+                      continue
+                  try:
+                      parsed = parse_complete_metadata_datetime(raw_value)
+                  except ValueError:
+                      parsed = None
+                  if parsed is None:
+                      continue
+                  local_datetime, _ = parsed
+                  expected_local = local_datetime + correction_delta
+                  expected_offset = get_unambiguous_timezone_offset(
+                      expected_local,
+                      classification_timezone,
+                  )
+                  expected_text = format_complete_datetime(
+                      raw_value,
+                      expected_local,
+                      expected_offset,
+                  )
+                  add_correction_operation(
+                      operations,
+                      skipped,
+                      {
+                          "target": "FileCreateDate",
+                          "value": expected_text,
+                          "kind": "datetime",
+                          "expected": (expected_local, expected_offset),
+                          "tag_name": tag_name,
+                          "source": metadata_key,
+                      },
+                  )
+          ''',
+          '''    # System creation time is shifted only for a timezone/DST correction.
+              # Choosing among conflicting embedded creation dates must not replace an
+              # unrelated filesystem creation timestamp with the capture timestamp.
+              if timezone_correction_active:
+                  for metadata_key, groups, tag_name, raw_value in records:
+                      if tag_name != "FileCreateDate":
+                          continue
+                      try:
+                          parsed = parse_complete_metadata_datetime(raw_value)
+                      except ValueError:
+                          parsed = None
+                      if parsed is None:
+                          continue
+                      local_datetime, _ = parsed
+                      expected_local = local_datetime + effective_correction_delta
+                      expected_offset = get_unambiguous_timezone_offset(
+                          expected_local,
+                          classification_timezone,
+                      )
+                      expected_text = format_complete_datetime(
+                          raw_value,
+                          expected_local,
+                          expected_offset,
+                      )
+                      add_correction_operation(
+                          operations,
+                          skipped,
+                          {
+                              "target": "FileCreateDate",
+                              "value": expected_text,
+                              "kind": "datetime",
+                              "expected": (expected_local, expected_offset),
+                              "tag_name": tag_name,
+                              "source": metadata_key,
+                          },
+                      )
+          ''',
+          "FileCreateDate correction guard",
+          )
+
+          replace_once(
+          '''def update_corrected_copy_metadata(
+              metadata_reader,
+              source_file,
+              destination_file,
+              correction_delta,
+              selected_corrected_datetime,
+              classification_timezone,
+          ):
+              """Correct writable metadata and system fallback times in a classified copy."""
+          ''',
+          '''def update_corrected_copy_metadata(
+              metadata_reader,
+              source_file,
+              destination_file,
+              correction_delta,
+              selected_corrected_datetime,
+              classification_timezone,
+              conflicting_date_values=None,
+          ):
+              """Correct writable metadata and applicable system times in a copy."""
+          ''',
+          "update_corrected_copy_metadata signature",
+          )
+
+          replace_once(
+          '''        selected_corrected_datetime,
+                  classification_timezone,
+              )
+              updated, write_skipped = execute_correction_operations(
+          ''',
+          '''        selected_corrected_datetime,
+                  classification_timezone,
+                  conflicting_date_values,
+              )
+              updated, write_skipped = execute_correction_operations(
+          ''',
+          "build_correction_operations call",
+          )
+
+          replace_once(
+          '''    # FileModifyDate is the cross-platform system fallback. Set it from the
+              # source baseline plus the approved correction so repeated runs are
+              # idempotent and never add the correction twice.
+              source_stat = source_file.stat()
+              corrected_mtime_ns = source_stat.st_mtime_ns + int(
+                  correction_delta.total_seconds() * 1_000_000_000
+              )
+              destination_stat = destination_file.stat()
+              os.utime(
+                  destination_file,
+                  ns=(destination_stat.st_atime_ns, corrected_mtime_ns),
+              )
+              if destination_file.stat().st_mtime_ns != corrected_mtime_ns:
+                  raise OSError(
+                      f"could not verify corrected FileModifyDate for '{destination_file}'"
+                  )
+              updated.append("FileModifyDate")
+          ''',
+          '''    # FileModifyDate is shifted only for a timezone/DST correction. Date
+              # conflict alignment updates the rejected embedded creation fields but
+              # does not overwrite unrelated filesystem modification semantics.
+              if correction_delta is not None:
+                  source_stat = source_file.stat()
+                  corrected_mtime_ns = source_stat.st_mtime_ns + int(
+                      correction_delta.total_seconds() * 1_000_000_000
+                  )
+                  destination_stat = destination_file.stat()
+                  os.utime(
+                      destination_file,
+                      ns=(destination_stat.st_atime_ns, corrected_mtime_ns),
+                  )
+                  if destination_file.stat().st_mtime_ns != corrected_mtime_ns:
+                      raise OSError(
+                          f"could not verify corrected FileModifyDate for '{destination_file}'"
+                      )
+                  updated.append("FileModifyDate")
+          ''',
+          "FileModifyDate correction guard",
+          )
+
+          replace_once(
+          '''def copy_file_with_corrected_metadata(
+              metadata_reader,
+              source_file,
+              requested_destination,
+              correction_delta,
+              selected_corrected_datetime,
+              classification_timezone,
+          ):
+          ''',
+          '''def copy_file_with_corrected_metadata(
+              metadata_reader,
+              source_file,
+              requested_destination,
+              correction_delta,
+              selected_corrected_datetime,
+              classification_timezone,
+              conflicting_date_values=None,
+          ):
+          ''',
+          "copy_file_with_corrected_metadata signature",
+          )
+
+          replace_once(
+          '''            selected_corrected_datetime,
+                      classification_timezone,
+                  )
+              except OSError:
+          ''',
+          '''            selected_corrected_datetime,
+                      classification_timezone,
+                      conflicting_date_values,
+                  )
+              except OSError:
+          ''',
+          "update_corrected_copy_metadata call",
+          )
+
+          replace_once(
+          '''        selected_date_option = None
+                  timezone_correction_delta = None
+          ''',
+          '''        selected_date_option = None
+                  timezone_correction_delta = None
+                  conflicting_date_values_by_file = {}
+          ''',
+          "group conflict state",
+          )
+
+          replace_once(
+          '''                print()
+                          break
+
+                  if (
+          ''',
+          '''                print()
+                          break
+
+                      # Remember the rejected embedded values per file. The copy pass
+                      # aligns only eligible capture/creation fields carrying one of
+                      # these values; unrelated timestamps are not overwritten.
+                      conflicting_date_values_by_file = {
+                          filename: {
+                              candidate[1]
+                              for candidate in candidates
+                              if candidate[0] == 1
+                              and candidate[1] != selected_date_value
+                          }
+                          for filename, candidates in file_dates.items()
+                      }
+                      conflicting_date_values_by_file = {
+                          filename: values
+                          for filename, values in conflicting_date_values_by_file.items()
+                          if values
+                      }
+
+                  if (
+          ''',
+          "record rejected date values",
+          )
+
+          replace_once(
+          '''            updated_metadata_targets = []
+                      skipped_metadata_targets = []
+                      corrected_copy = (
+                          timezone_correction_delta is not None
+                          and same_stem_file not in review_reasons
+                      )
+                      already_corrected = False
+          ''',
+          '''            updated_metadata_targets = []
+                      skipped_metadata_targets = []
+                      conflicting_date_values = conflicting_date_values_by_file.get(
+                          same_stem_file,
+                          set(),
+                      )
+                      corrected_copy = (
+                          (
+                              timezone_correction_delta is not None
+                              or bool(conflicting_date_values)
+                          )
+                          and same_stem_file not in review_reasons
+                      )
+                      already_corrected = False
+          ''',
+          "corrected copy selection",
+          )
+
+          replace_once(
+          '''                        selected_file_date[1],
+                                  classification_timezone,
+                              )
+                          else:
+          ''',
+          '''                        selected_file_date[1],
+                                  classification_timezone,
+                                  conflicting_date_values,
+                              )
+                          else:
+          ''',
+          "copy correction arguments",
+          )
+
+          script_path.write_text(text, encoding="utf-8")
+
+          readme_path = Path("README.md")
+          readme = readme_path.read_text(encoding="utf-8")
+          anchor = (
+              "When distinct complete embedded timestamps are found anywhere in a related group, "
+              "the script lists their full ExifTool source paths and asks the user to choose one. "
+              "Each filename is displayed once per option, followed by all matching fields for that "
+              "file. Duplicate occurrences of the same field are collapsed.\n"
+          )
+          addition = anchor + """
+
+After the user chooses the authoritative value, the classified copies are normalized to that decision. For each file, eligible capture/creation fields carrying one of the rejected complete timestamps are rewritten to the chosen timestamp. Paired IPTC date/time components are updated together, and derived Composite values follow the corrected underlying fields. Existing inline or separate UTC offsets and writable daylight-saving settings are adjusted for the chosen local date when their representation is unambiguous.
+
+This alignment is deliberately narrower than a blanket metadata rewrite: UTC reference fields, editing/history/resource timestamps, and unrelated filesystem creation or modification times are not replaced merely because a capture-date conflict was resolved. If the chosen value subsequently receives a timezone/daylight-saving correction, both the selected fields and the rejected conflicting fields converge on the final corrected value. As with DST correction, only classified copies are edited; original source files remain unchanged.
+"""
+          if readme.count(anchor) != 1:
+              raise SystemExit("README conflict paragraph anchor not found exactly once")
+          readme = readme.replace(anchor, addition, 1)
+          readme_path.write_text(readme, encoding="utf-8")
+          PY
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Compile and test alignment planning
+        shell: bash
+        run: |
+          python -m py_compile reclassify_datetaken.py
+          python - <<'PY'
+          from datetime import datetime, timedelta
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          source = Path("reclassify_datetaken.py").read_text(encoding="utf-8")
+          prefix = source.split(
+              "# Request the source directory and intentionally process only regular files",
+              1,
+          )[0]
+          namespace = {}
+          exec(compile(prefix, "reclassify_datetaken.py", "exec"), namespace)
+
+          build = namespace["build_correction_operations"]
+          metadata = {
+              "SourceFile": "test.jpg",
+              "EXIF:ExifIFD:DateTimeOriginal": "2024:01:10 09:00:00",
+              "EXIF:ExifIFD:CreateDate": "2024:02:20 10:00:00",
+              "EXIF:IFD0:ModifyDate": "2020:05:05 14:00:00",
+              "XMP:XMP-xmp:CreateDate": "2024-03-30T11:00:00+01:00",
+              "IPTC:IPTC:DateCreated": "2024:04:04",
+              "IPTC:IPTC:TimeCreated": "13:00:00",
+              "Composite:Composite:DateTimeCreated": "2024:04:04 13:00:00",
+              "EXIF:ExifIFD:OffsetTimeOriginal": "+01:00",
+              "EXIF:ExifIFD:OffsetTimeDigitized": "+01:00",
+              "MakerNotes:Canon:DaylightSavings": 0,
+              "File:System:FileCreateDate": "2024:06:01 08:00:00+02:00",
+          }
+          selected = datetime(2024, 9, 14, 0, 43, 31)
+          rejected = {
+              datetime(2024, 2, 20, 10, 0, 0),
+              datetime(2024, 3, 30, 11, 0, 0),
+              datetime(2024, 4, 4, 13, 0, 0),
+          }
+          operations, skipped = build(
+              metadata,
+              None,
+              selected,
+              ZoneInfo("Europe/Berlin"),
+              rejected,
+          )
+          by_target = {op["target"].rstrip("#"): op for op in operations}
+
+          assert by_target["ExifIFD:CreateDate"]["expected"][0] == selected
+          assert by_target["XMP-xmp:CreateDate"]["expected"] == (selected, 120)
+          assert by_target["IPTC:DateCreated"]["expected"] == (2024, 9, 14)
+          assert by_target["IPTC:TimeCreated"]["expected"] == (0, 43, 31, None)
+          assert "ExifIFD:DateTimeOriginal" not in by_target
+          assert "IFD0:ModifyDate" not in by_target
+          assert "FileCreateDate" not in by_target
+          assert by_target["ExifIFD:OffsetTimeDigitized"]["expected"] == 120
+          assert by_target["Canon:DaylightSavings"]["expected"] is True
+
+          operations, skipped = build(
+              metadata,
+              timedelta(hours=1),
+              datetime(2024, 9, 14, 1, 43, 31),
+              ZoneInfo("Europe/Berlin"),
+              rejected,
+          )
+          by_target = {op["target"].rstrip("#"): op for op in operations}
+          assert by_target["ExifIFD:CreateDate"]["expected"][0] == datetime(
+              2024, 9, 14, 1, 43, 31
+          )
+          assert by_target["ExifIFD:DateTimeOriginal"]["expected"][0] == datetime(
+              2024, 1, 10, 10, 0, 0
+          )
+          assert by_target["IFD0:ModifyDate"]["expected"][0] == datetime(
+              2020, 5, 5, 15, 0, 0
+          )
+          assert "FileCreateDate" in by_target
+
+          assert "conflicting_date_values_by_file" in source
+          assert "or bool(conflicting_date_values)" in source
+          print("date conflict alignment tests passed")
+          PY
+
+      - name: Commit finalized changes and remove one-shot files
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm -f .github/workflows/apply-date-conflict-alignment.yml
+          git rm -f .github/tmp/run-date-conflict-alignment
+          git add reclassify_datetaken.py README.md
+          git commit -m "Align rejected metadata dates to selected value"
+          git push origin HEAD:agent/replace-pillow-pyexiftool
