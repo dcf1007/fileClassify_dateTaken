@@ -1,0 +1,60 @@
+name: Trigger chosen-date alignment updater
+
+on:
+  pull_request_target:
+    branches:
+      - agent/replace-pillow-pyexiftool
+    paths:
+      - .github/tmp/run-date-conflict-alignment-pr
+
+permissions:
+  contents: write
+
+jobs:
+  run-existing-updater:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/replace-pillow-pyexiftool
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Execute the tested one-shot updater steps
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          workflow = Path(
+              ".github/workflows/apply-date-conflict-alignment.yml"
+          ).read_text(encoding="utf-8").splitlines()
+
+          scripts = []
+          index = 0
+          while index < len(workflow):
+              if workflow[index] == "        run: |":
+                  index += 1
+                  block = []
+                  while index < len(workflow):
+                      line = workflow[index]
+                      if line and not line.startswith("          "):
+                          break
+                      block.append(line[10:] if line else "")
+                      index += 1
+                  scripts.append("\n".join(block))
+                  continue
+              index += 1
+
+          if len(scripts) != 4:
+              raise SystemExit(
+                  f"expected four updater shell blocks, found {len(scripts)}"
+              )
+
+          for script in scripts:
+              subprocess.run(["bash", "-e", "-c", script], check=True)
+          PY
