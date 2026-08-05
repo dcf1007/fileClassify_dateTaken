@@ -7,6 +7,8 @@ import PIL.Image
 from PIL import UnidentifiedImageError
 
 
+VERSION = "0.2.0"
+
 # Preserve the original support for very large RAW-derived images and panoramas.
 # This setting will be reviewed later with the metadata modernization.
 PIL.Image.MAX_IMAGE_PIXELS = None
