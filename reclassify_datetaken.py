@@ -7,7 +7,7 @@ import PIL.Image
 from PIL import UnidentifiedImageError
 
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 
 # Preserve the original support for very large RAW-derived images and panoramas.
 # This setting will be reviewed later with the metadata modernization.
@@ -56,14 +56,8 @@ def get_date(filename):
             if callable(legacy_exif_reader):
                 try:
                     exif_data = legacy_exif_reader()
-                except (
-                    AttributeError,
-                    IndexError,
-                    KeyError,
-                    OSError,
-                    TypeError,
-                    ValueError,
-                ) as error:
+                except (AttributeError, IndexError, KeyError, OSError,
+                        TypeError, ValueError) as error:
                     return None, None, f"could not read EXIF metadata ({error})"
 
                 if exif_data:
@@ -75,14 +69,8 @@ def get_date(filename):
                 if tiff_tags is not None:
                     try:
                         exif_date_text = tiff_tags.get(EXIF_DATE_TAG)
-                    except (
-                        AttributeError,
-                        IndexError,
-                        KeyError,
-                        OSError,
-                        TypeError,
-                        ValueError,
-                    ) as error:
+                    except (AttributeError, IndexError, KeyError, OSError,
+                            TypeError, ValueError) as error:
                         return None, None, f"could not read TIFF metadata ({error})"
 
             # An image that opens but fails verification is not trusted.
@@ -322,6 +310,9 @@ for same_stem_files in same_stem_groups:
     review_reasons = {}
     selected_file_date = None
 
+    # Read every usable date before selecting the date for the group. The
+    # original script selected a date while scanning the files. Collecting all
+    # candidates first allows conflicting values to be shown to the user.
     for same_stem_file in same_stem_files:
         try:
             date_type, date_value, review_reason = get_date(same_stem_file)
@@ -338,21 +329,85 @@ for same_stem_files in same_stem_groups:
             review_reasons[same_stem_file] = review_reason
             continue
 
-        current_file_date = (date_type, date_value)
-        file_dates[same_stem_file] = current_file_date
+        file_dates[same_stem_file] = (date_type, date_value)
 
-        if selected_file_date is None:
-            selected_file_date = current_file_date
+    # Group identical date values together. The source type is intentionally
+    # not part of the key: an EXIF date and an OS date with the exact same
+    # timestamp do not conflict. When both sources support the same value,
+    # EXIF is retained as the representative source because it is more direct.
+    date_options = {}
+    for same_stem_file, file_date in file_dates.items():
+        date_type, date_value = file_date
+        date_option = date_options.setdefault(
+            date_value,
+            {"date_type": date_type, "files": []},
+        )
+        date_option["date_type"] = max(
+            date_option["date_type"],
+            date_type,
+        )
+        date_option["files"].append((same_stem_file, date_type))
 
-        # Preserve the original rule: oldest date when the sources match;
-        # otherwise an EXIF date replaces an OS-derived date.
-        elif (
-            selected_file_date[0] == current_file_date[0]
-            and selected_file_date[1] > current_file_date[1]
+    if len(date_options) == 1:
+        # All usable files agree on one timestamp, so no user interaction is
+        # required. Use the strongest source associated with that timestamp.
+        date_value, date_option = next(iter(date_options.items()))
+        selected_file_date = (date_option["date_type"], date_value)
+
+    elif len(date_options) > 1:
+        # More than one distinct timestamp was found in the related group.
+        # List every option with the files and date sources that supplied it,
+        # then require a valid numbered choice before copying the group.
+        sorted_date_options = sorted(date_options.items())
+
+        print()
+        print("Conflicting dates found for these related files:")
+        for same_stem_file in same_stem_files:
+            print(f"  - {same_stem_file.name}")
+
+        print("Choose the date that should be used for this group:")
+        for option_number, (date_value, date_option) in enumerate(
+            sorted_date_options,
+            start=1,
         ):
-            selected_file_date = current_file_date
-        elif selected_file_date[0] < current_file_date[0]:
-            selected_file_date = current_file_date
+            date_sources = ", ".join(
+                f"{filename.name} ({DATETYPE[date_type]})"
+                for filename, date_type in date_option["files"]
+            )
+            print(
+                f"  {option_number}. "
+                f"{date_value.strftime('%Y-%m-%d %H:%M:%S')} "
+                f"- {date_sources}"
+            )
+
+        while True:
+            raw_selection = input(
+                f"Enter a number from 1 to {len(sorted_date_options)}: "
+            ).strip()
+
+            try:
+                selected_option_number = int(raw_selection)
+            except ValueError:
+                print("Invalid selection. Enter one of the listed numbers.")
+                continue
+
+            if not 1 <= selected_option_number <= len(sorted_date_options):
+                print("Invalid selection. Enter one of the listed numbers.")
+                continue
+
+            selected_date_value, selected_date_option = sorted_date_options[
+                selected_option_number - 1
+            ]
+            selected_file_date = (
+                selected_date_option["date_type"],
+                selected_date_value,
+            )
+            print(
+                "Selected date: "
+                f"{selected_date_value.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+            print()
+            break
 
     for same_stem_file in same_stem_files:
         if same_stem_file in review_reasons:
@@ -360,8 +415,12 @@ for same_stem_files in same_stem_groups:
             destination_directory = unclassified_directory
         elif same_stem_file in file_dates and selected_file_date is not None:
             date_folder_name = selected_file_date[1].strftime("%Y-%m-%d")
-            folder_name = f"{CLASSIFIED_FOLDER_NAME}/{date_folder_name}"
-            destination_directory = classified_directory / date_folder_name
+            folder_name = (
+                f"{CLASSIFIED_FOLDER_NAME}/{date_folder_name}"
+            )
+            destination_directory = (
+                classified_directory / date_folder_name
+            )
         else:
             continue
 
