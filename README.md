@@ -2,18 +2,21 @@
 
 `fileClassify_dateTaken` is an interactive Python script that classifies files by their best available date while preserving the original source files.
 
-Current version: **0.2.0**
+Current version: **0.3.0**
 
 ## Requirements
 
 - Python 3
-- Pillow
+- ExifTool available as the `exiftool` command
+- PyExifTool
 
-Install Pillow with:
+Install PyExifTool with:
 
 ```bash
-python -m pip install Pillow
+python -m pip install PyExifTool
 ```
+
+Install ExifTool for the operating system and ensure the `exiftool` command is available on `PATH`.
 
 ## Usage
 
@@ -34,10 +37,10 @@ The script:
 - groups files with identical stems;
 - attaches derivative stems to the longest matching base stem;
 - treats an immediate numeric continuation as a separate group;
-- reads these EXIF date fields from recognized images with Pillow:
-  - `DateTimeOriginal`;
-  - `DateTimeDigitized`;
-  - `DateTime`;
+- reads these EXIF date fields from recognized images with ExifTool:
+  - `ExifIFD:DateTimeOriginal`;
+  - `ExifIFD:CreateDate`;
+  - `IFD0:ModifyDate`;
 - retains every valid supported EXIF date found in a file;
 - uses the filesystem modification time when no supported EXIF date is available;
 - asks the user to select the authoritative date when a related group contains conflicting values;
