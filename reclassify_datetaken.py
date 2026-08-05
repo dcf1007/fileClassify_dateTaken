@@ -5,6 +5,8 @@ import pathlib
 import PIL.Image
 from datetime import datetime
 
+VERSION = "0.1.0"
+
 #Disable max pixels to avoid errors in RAW files and panoramas
 PIL.Image.MAX_IMAGE_PIXELS = None
 
