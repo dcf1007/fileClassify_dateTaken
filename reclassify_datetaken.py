@@ -7,7 +7,7 @@ import PIL.Image
 from PIL import UnidentifiedImageError
 
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 
 # Preserve the original support for very large RAW-derived images and panoramas.
 # This setting will be reviewed later with the metadata modernization.
@@ -15,7 +15,18 @@ PIL.Image.MAX_IMAGE_PIXELS = None
 PIL.Image.init()
 
 DATETYPE = {0: "OS_DATE", 1: "EXIF"}
-EXIF_DATE_TAG = 36867
+
+# These are the three standard EXIF date fields commonly found in older
+# cameras and image-editing software. DateTimeOriginal normally describes when
+# the picture was taken, DateTimeDigitized describes when it became digital,
+# and DateTime describes when the image metadata was last changed. Until the
+# later ExifTool modernization, these are the date fields available through the
+# current Pillow-based reader.
+EXIF_DATE_TAGS = {
+    36867: "DateTimeOriginal",
+    36868: "DateTimeDigitized",
+    306: "DateTime",
+}
 EXIF_DATE_FORMAT = "%Y:%m:%d %H:%M:%S"
 CLASSIFIED_FOLDER_NAME = "classified"
 UNCLASSIFIED_FOLDER_NAME = "unclassified"
@@ -38,81 +49,147 @@ def clean_input_path(raw_path):
     return Path(cleaned_path).expanduser()
 
 
-def get_date(filename):
+def get_dates(filename):
     """
-    Return (date_type, date_value, review_reason).
+    Return (date_candidates, review_reason).
 
-    This keeps the original priority: EXIF DateTimeOriginal first, filesystem
-    modification time second. A damaged image or invalid EXIF date is marked
-    for review instead of silently receiving its modification date.
+    Each date candidate is stored as:
+
+        (date_type, date_value, source_name)
+
+    A single file may contain several EXIF date fields. All valid values are
+    returned so the main processing loop can detect a disagreement within one
+    file in exactly the same way as a disagreement between related files.
+
+    If no supported EXIF date exists, the filesystem modification time is used
+    as the original script's fallback. The modification time is not added when
+    EXIF dates are present, because it remains a last resort rather than an
+    equal alternative to embedded metadata.
+
+    A damaged image, unreadable metadata, or any present EXIF date that cannot
+    be parsed returns a review reason. Such a file is copied to unclassified
+    rather than classified using a timestamp that may be unreliable.
     """
-    exif_date_text = None
+    exif_date_values = {}
 
     try:
         with PIL.Image.open(filename) as image:
             # Keep the original JPEG-style EXIF access until the later
-            # metadata modernization changes this in isolation.
+            # metadata modernization changes this in isolation. The legacy
+            # dictionary is flattened, allowing the three supported EXIF date
+            # tags to be checked directly.
             legacy_exif_reader = getattr(image, "_getexif", None)
             if callable(legacy_exif_reader):
                 try:
                     exif_data = legacy_exif_reader()
-                except (AttributeError, IndexError, KeyError, OSError,
-                        TypeError, ValueError) as error:
-                    return None, None, f"could not read EXIF metadata ({error})"
+                except (
+                    AttributeError,
+                    IndexError,
+                    KeyError,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                ) as error:
+                    return [], f"could not read EXIF metadata ({error})"
 
                 if exif_data:
-                    exif_date_text = exif_data.get(EXIF_DATE_TAG)
+                    for exif_tag, field_name in EXIF_DATE_TAGS.items():
+                        exif_date_text = exif_data.get(exif_tag)
+                        if exif_date_text is not None:
+                            exif_date_values[field_name] = exif_date_text
 
-            # Keep the original TIFF-specific fallback for the same reason.
-            if exif_date_text is None:
-                tiff_tags = getattr(image, "tag", None)
-                if tiff_tags is not None:
+            # Keep the original TIFF-specific fallback. Read only fields that
+            # were not already obtained through _getexif(), preventing the
+            # same physical field from being listed twice.
+            tiff_tags = getattr(image, "tag", None)
+            if tiff_tags is not None:
+                for exif_tag, field_name in EXIF_DATE_TAGS.items():
+                    if field_name in exif_date_values:
+                        continue
+
                     try:
-                        exif_date_text = tiff_tags.get(EXIF_DATE_TAG)
-                    except (AttributeError, IndexError, KeyError, OSError,
-                            TypeError, ValueError) as error:
-                        return None, None, f"could not read TIFF metadata ({error})"
+                        exif_date_text = tiff_tags.get(exif_tag)
+                    except (
+                        AttributeError,
+                        IndexError,
+                        KeyError,
+                        OSError,
+                        TypeError,
+                        ValueError,
+                    ) as error:
+                        return [], f"could not read TIFF metadata ({error})"
+
+                    if exif_date_text is not None:
+                        exif_date_values[field_name] = exif_date_text
 
             # An image that opens but fails verification is not trusted.
             try:
                 image.verify()
             except (OSError, SyntaxError, ValueError) as error:
-                return None, None, f"image verification failed ({error})"
+                return [], f"image verification failed ({error})"
 
     except UnidentifiedImageError as error:
         # Unknown non-image files retain the original modification-time
         # fallback. A recognized image extension is routed for review.
         if filename.suffix.casefold() in IMAGE_EXTENSIONS:
-            return None, None, f"Pillow could not identify the image ({error})"
-        return 0, datetime.fromtimestamp(filename.stat().st_mtime), None
+            return [], f"Pillow could not identify the image ({error})"
+
+        modification_date = datetime.fromtimestamp(filename.stat().st_mtime)
+        return [(0, modification_date, DATETYPE[0])], None
 
     except PermissionError as error:
         raise OSError(f"cannot read '{filename}': {error}") from error
 
     except (OSError, SyntaxError, ValueError) as error:
         if filename.suffix.casefold() in IMAGE_EXTENSIONS:
-            return None, None, f"could not inspect image metadata ({error})"
-        return 0, datetime.fromtimestamp(filename.stat().st_mtime), None
+            return [], f"could not inspect image metadata ({error})"
 
-    # TIFF metadata may return a one-item sequence instead of a plain value.
-    if isinstance(exif_date_text, (list, tuple)):
-        exif_date_text = exif_date_text[0] if exif_date_text else None
+        modification_date = datetime.fromtimestamp(filename.stat().st_mtime)
+        return [(0, modification_date, DATETYPE[0])], None
 
-    if isinstance(exif_date_text, bytes):
+    date_candidates = []
+
+    # Parse every supported EXIF field that is present. Keeping the field name
+    # with the timestamp lets the conflict list explain exactly where each
+    # value came from.
+    for field_name, exif_date_text in exif_date_values.items():
+        # TIFF metadata may return a one-item sequence instead of a plain value.
+        if isinstance(exif_date_text, (list, tuple)):
+            exif_date_text = exif_date_text[0] if exif_date_text else None
+
+        if isinstance(exif_date_text, bytes):
+            try:
+                exif_date_text = exif_date_text.decode("ascii")
+            except UnicodeDecodeError as error:
+                return [], (
+                    f"EXIF {field_name} is not valid ASCII ({error})"
+                )
+
+        if exif_date_text is None:
+            continue
+
         try:
-            exif_date_text = exif_date_text.decode("ascii")
-        except UnicodeDecodeError as error:
-            return None, None, f"EXIF date is not valid ASCII ({error})"
-
-    if exif_date_text is not None:
-        try:
-            exif_date = datetime.strptime(exif_date_text, EXIF_DATE_FORMAT)
+            exif_date = datetime.strptime(
+                exif_date_text,
+                EXIF_DATE_FORMAT,
+            )
         except (TypeError, ValueError) as error:
-            return None, None, f"invalid EXIF date {exif_date_text!r} ({error})"
-        return 1, exif_date, None
+            return [], (
+                f"invalid EXIF {field_name} date "
+                f"{exif_date_text!r} ({error})"
+            )
 
-    # A valid image without DateTimeOriginal is not damaged.
-    return 0, datetime.fromtimestamp(filename.stat().st_mtime), None
+        date_candidates.append(
+            (1, exif_date, f"EXIF {field_name}")
+        )
+
+    if date_candidates:
+        return date_candidates, None
+
+    # A valid image without one of the supported EXIF date fields is not
+    # damaged. Preserve the original filesystem modification-time fallback.
+    modification_date = datetime.fromtimestamp(filename.stat().st_mtime)
+    return [(0, modification_date, DATETYPE[0])], None
 
 
 def stems_are_related(base_stem, longer_stem):
@@ -126,7 +203,10 @@ def stems_are_related(base_stem, longer_stem):
     base_stem = base_stem.casefold()
     longer_stem = longer_stem.casefold()
 
-    if len(longer_stem) <= len(base_stem) or not longer_stem.startswith(base_stem):
+    if (
+        len(longer_stem) <= len(base_stem)
+        or not longer_stem.startswith(base_stem)
+    ):
         return False
 
     first_added_character = longer_stem[len(base_stem)]
@@ -156,13 +236,18 @@ def group_related_files(files):
         ]
 
         if matching_bases:
-            groups[max(matching_bases, key=len)].extend(files_by_stem[stem])
+            groups[max(matching_bases, key=len)].extend(
+                files_by_stem[stem]
+            )
         else:
             groups[stem] = list(files_by_stem[stem])
 
     return [
         sorted(group, key=lambda path: path.name.casefold())
-        for _, group in sorted(groups.items(), key=lambda item: item[0].casefold())
+        for _, group in sorted(
+            groups.items(),
+            key=lambda item: item[0].casefold(),
+        )
     ]
 
 
@@ -173,15 +258,16 @@ def files_are_binary_identical(first_file, second_file):
     if first_file.stat().st_size != second_file.stat().st_size:
         return False
 
-    with first_file.open("rb") as first_stream, second_file.open("rb") as second_stream:
-        while True:
-            first_chunk = first_stream.read(COPY_CHUNK_SIZE)
-            second_chunk = second_stream.read(COPY_CHUNK_SIZE)
+    with first_file.open("rb") as first_stream:
+        with second_file.open("rb") as second_stream:
+            while True:
+                first_chunk = first_stream.read(COPY_CHUNK_SIZE)
+                second_chunk = second_stream.read(COPY_CHUNK_SIZE)
 
-            if first_chunk != second_chunk:
-                return False
-            if not first_chunk:
-                return True
+                if first_chunk != second_chunk:
+                    return False
+                if not first_chunk:
+                    return True
 
 
 def copy_file_safely(source_file, requested_destination):
@@ -203,7 +289,10 @@ def copy_file_safely(source_file, requested_destination):
             )
 
         if destination_file.exists():
-            if files_are_binary_identical(source_file, destination_file):
+            if files_are_binary_identical(
+                source_file,
+                destination_file,
+            ):
                 return destination_file, False, suffix_number > 0
             suffix_number += 1
             continue
@@ -315,53 +404,65 @@ for same_stem_files in same_stem_groups:
     # candidates first allows conflicting values to be shown to the user.
     for same_stem_file in same_stem_files:
         try:
-            date_type, date_value, review_reason = get_date(same_stem_file)
+            date_candidates, review_reason = get_dates(same_stem_file)
         except OSError as error:
-            print(f"Error reading '{same_stem_file.name}': {error}", file=sys.stderr)
+            print(
+                f"Error reading '{same_stem_file.name}': {error}",
+                file=sys.stderr,
+            )
             failed_count += 1
             continue
 
         if review_reason is not None:
             print(
-                f"Warning: '{same_stem_file.name}' requires review: {review_reason}",
+                f"Warning: '{same_stem_file.name}' requires review: "
+                f"{review_reason}",
                 file=sys.stderr,
             )
             review_reasons[same_stem_file] = review_reason
             continue
 
-        file_dates[same_stem_file] = (date_type, date_value)
+        # Store every candidate returned for this file. A file with conflicting
+        # EXIF fields can therefore produce several date options even when it
+        # is the only file in its related group.
+        file_dates[same_stem_file] = date_candidates
 
-    # Group identical date values together. The source type is intentionally
-    # not part of the key: an EXIF date and an OS date with the exact same
-    # timestamp do not conflict. When both sources support the same value,
-    # EXIF is retained as the representative source because it is more direct.
+    # Group identical timestamp values together, whether they came from
+    # separate files or separate fields inside one file. The source is not
+    # part of the key: fields containing the exact same timestamp agree and do
+    # not require a prompt. Their file and field names are retained for display.
     date_options = {}
-    for same_stem_file, file_date in file_dates.items():
-        date_type, date_value = file_date
-        date_option = date_options.setdefault(
-            date_value,
-            {"date_type": date_type, "files": []},
-        )
-        date_option["date_type"] = max(
-            date_option["date_type"],
-            date_type,
-        )
-        date_option["files"].append((same_stem_file, date_type))
+    for same_stem_file, date_candidates in file_dates.items():
+        for date_type, date_value, source_name in date_candidates:
+            date_option = date_options.setdefault(
+                date_value,
+                {"date_type": date_type, "sources": []},
+            )
+            date_option["date_type"] = max(
+                date_option["date_type"],
+                date_type,
+            )
+            date_option["sources"].append(
+                (same_stem_file, source_name)
+            )
 
     if len(date_options) == 1:
-        # All usable files agree on one timestamp, so no user interaction is
-        # required. Use the strongest source associated with that timestamp.
+        # Every available field agrees on one timestamp, so no user interaction
+        # is required. Use the strongest source associated with that timestamp.
         date_value, date_option = next(iter(date_options.items()))
-        selected_file_date = (date_option["date_type"], date_value)
+        selected_file_date = (
+            date_option["date_type"],
+            date_value,
+        )
 
     elif len(date_options) > 1:
-        # More than one distinct timestamp was found in the related group.
-        # List every option with the files and date sources that supplied it,
-        # then require a valid numbered choice before copying the group.
+        # More than one distinct timestamp was found in the related group. The
+        # disagreement may be between files, between fields in one file, or
+        # both. List every source and require a numbered user choice.
         sorted_date_options = sorted(date_options.items())
 
         print()
-        print("Conflicting dates found for these related files:")
+        print("Conflicting dates found for this related group:")
         for same_stem_file in same_stem_files:
             print(f"  - {same_stem_file.name}")
 
@@ -371,8 +472,8 @@ for same_stem_files in same_stem_groups:
             start=1,
         ):
             date_sources = ", ".join(
-                f"{filename.name} ({DATETYPE[date_type]})"
-                for filename, date_type in date_option["files"]
+                f"{filename.name} ({source_name})"
+                for filename, source_name in date_option["sources"]
             )
             print(
                 f"  {option_number}. "
@@ -382,17 +483,22 @@ for same_stem_files in same_stem_groups:
 
         while True:
             raw_selection = input(
-                f"Enter a number from 1 to {len(sorted_date_options)}: "
+                f"Enter a number from 1 to "
+                f"{len(sorted_date_options)}: "
             ).strip()
 
             try:
                 selected_option_number = int(raw_selection)
             except ValueError:
-                print("Invalid selection. Enter one of the listed numbers.")
+                print(
+                    "Invalid selection. Enter one of the listed numbers."
+                )
                 continue
 
             if not 1 <= selected_option_number <= len(sorted_date_options):
-                print("Invalid selection. Enter one of the listed numbers.")
+                print(
+                    "Invalid selection. Enter one of the listed numbers."
+                )
                 continue
 
             selected_date_value, selected_date_option = sorted_date_options[
@@ -413,7 +519,10 @@ for same_stem_files in same_stem_groups:
         if same_stem_file in review_reasons:
             folder_name = UNCLASSIFIED_FOLDER_NAME
             destination_directory = unclassified_directory
-        elif same_stem_file in file_dates and selected_file_date is not None:
+        elif (
+            same_stem_file in file_dates
+            and selected_file_date is not None
+        ):
             date_folder_name = selected_file_date[1].strftime("%Y-%m-%d")
             folder_name = (
                 f"{CLASSIFIED_FOLDER_NAME}/{date_folder_name}"
@@ -424,7 +533,10 @@ for same_stem_files in same_stem_groups:
         else:
             continue
 
-        if destination_directory.exists() and not destination_directory.is_dir():
+        if (
+            destination_directory.exists()
+            and not destination_directory.is_dir()
+        ):
             print(
                 f"Error: '{destination_directory}' is a file. "
                 f"Skipping '{same_stem_file.name}'.",
@@ -440,11 +552,17 @@ for same_stem_files in same_stem_groups:
                 destination_directory / same_stem_file.name,
             )
         except OSError as error:
-            print(f"Error copying '{same_stem_file.name}': {error}", file=sys.stderr)
+            print(
+                f"Error copying '{same_stem_file.name}': {error}",
+                file=sys.stderr,
+            )
             failed_count += 1
             continue
 
-        print(f"{same_stem_file.name}\t--->\t{folder_name}\t", end="")
+        print(
+            f"{same_stem_file.name}\t--->\t{folder_name}\t",
+            end="",
+        )
 
         if copied:
             copied_count += 1
@@ -455,11 +573,17 @@ for same_stem_files in same_stem_groups:
                 print("COPIED", end="")
         else:
             duplicate_count += 1
-            print(f"DUPLICATE OF {destination_file.name}", end="")
+            print(
+                f"DUPLICATE OF {destination_file.name}",
+                end="",
+            )
 
         if same_stem_file in review_reasons:
             review_count += 1
-            print(f"; REVIEW: {review_reasons[same_stem_file]}", end="")
+            print(
+                f"; REVIEW: {review_reasons[same_stem_file]}",
+                end="",
+            )
         else:
             print(
                 f"; {selected_file_date[1].strftime('%Y-%m-%d %H:%M:%S')} "
