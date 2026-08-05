@@ -7,7 +7,9 @@ from exiftool import ExifToolHelper
 from exiftool.exceptions import ExifToolException, ExifToolExecuteError
 
 
-VERSION = "0.3.0"
+# Constants and metadata fields
+
+VERSION = "0.3.1"
 
 DATETYPE = {0: "OS_DATE", 1: "EXIF"}
 
@@ -112,18 +114,7 @@ IMAGE_EXTENSIONS = {
     ".xpm",
 }
 
-
-def clean_input_path(raw_path):
-    """Remove one matching pair of drag-and-drop quotes."""
-    cleaned_path = raw_path.strip()
-    if (
-        len(cleaned_path) >= 2
-        and cleaned_path[0] == cleaned_path[-1]
-        and cleaned_path[0] in {'"', "'"}
-    ):
-        cleaned_path = cleaned_path[1:-1]
-    return Path(cleaned_path).expanduser()
-
+# Metadata reading
 
 def get_dates(filename):
     """
@@ -201,8 +192,9 @@ def get_dates(filename):
         modification_date = datetime.fromtimestamp(filename.stat().st_mtime)
         return [(0, modification_date, DATETYPE[0])], None
 
-    # A recognized image extension without an image MIME type represents the
-    # same damaged-or-unreadable case that was previously detected by Pillow.
+    # A recognized image extension without an image MIME type is treated as an
+    # unreadable image rather than as an ordinary non-image file. This preserves
+    # the established behavior of routing damaged recognized images for review.
     if not identified_image:
         if recognized_extension:
             return [], "ExifTool could not identify the image"
@@ -240,6 +232,8 @@ def get_dates(filename):
     modification_date = datetime.fromtimestamp(filename.stat().st_mtime)
     return [(0, modification_date, DATETYPE[0])], None
 
+
+# Related-file grouping and safe copying
 
 def stems_are_related(base_stem, longer_stem):
     """
@@ -285,9 +279,7 @@ def group_related_files(files):
         ]
 
         if matching_bases:
-            groups[max(matching_bases, key=len)].extend(
-                files_by_stem[stem]
-            )
+            groups[max(matching_bases, key=len)].extend(files_by_stem[stem])
         else:
             groups[stem] = list(files_by_stem[stem])
 
@@ -375,12 +367,25 @@ def copy_file_safely(source_file, requested_destination):
         return destination_file, True, suffix_number > 0
 
 
+# Input and output preparation
+
 # Request the source directory interactively. The script deliberately examines
 # only regular files located directly inside this directory. It never walks
 # into existing subdirectories.
-directory = clean_input_path(
-    input("Please write (or drag) the source directory path: ")
-)
+raw_directory = input(
+    "Please write (or drag) the source directory path: "
+).strip()
+
+# Paths dragged into a terminal may be enclosed in matching single or double
+# quotes. Remove only that outer pair, preserving every character inside it.
+if (
+    len(raw_directory) >= 2
+    and raw_directory[0] == raw_directory[-1]
+    and raw_directory[0] in {'"', "'"}
+):
+    raw_directory = raw_directory[1:-1]
+
+directory = Path(raw_directory).expanduser()
 
 if not directory.exists() or not directory.is_dir():
     print(f"Error: source directory is invalid: '{directory}'")
@@ -432,6 +437,8 @@ except OSError as error:
     print(f"Error preparing directories: {error}")
     input("Press Enter to exit")
     raise SystemExit(1)
+
+# Date selection and file classification
 
 same_stem_groups = group_related_files(source_files)
 
@@ -531,22 +538,17 @@ for same_stem_files in same_stem_groups:
 
         while True:
             raw_selection = input(
-                f"Enter a number from 1 to "
-                f"{len(sorted_date_options)}: "
+                f"Enter a number from 1 to {len(sorted_date_options)}: "
             ).strip()
 
             try:
                 selected_option_number = int(raw_selection)
             except ValueError:
-                print(
-                    "Invalid selection. Enter one of the listed numbers."
-                )
+                print("Invalid selection. Enter one of the listed numbers.")
                 continue
 
             if not 1 <= selected_option_number <= len(sorted_date_options):
-                print(
-                    "Invalid selection. Enter one of the listed numbers."
-                )
+                print("Invalid selection. Enter one of the listed numbers.")
                 continue
 
             selected_date_value, selected_date_option = sorted_date_options[
@@ -572,12 +574,8 @@ for same_stem_files in same_stem_groups:
             and selected_file_date is not None
         ):
             date_folder_name = selected_file_date[1].strftime("%Y-%m-%d")
-            folder_name = (
-                f"{CLASSIFIED_FOLDER_NAME}/{date_folder_name}"
-            )
-            destination_directory = (
-                classified_directory / date_folder_name
-            )
+            folder_name = f"{CLASSIFIED_FOLDER_NAME}/{date_folder_name}"
+            destination_directory = classified_directory / date_folder_name
         else:
             continue
 
@@ -607,10 +605,7 @@ for same_stem_files in same_stem_groups:
             failed_count += 1
             continue
 
-        print(
-            f"{same_stem_file.name}\t--->\t{folder_name}\t",
-            end="",
-        )
+        print(f"{same_stem_file.name}\t--->\t{folder_name}\t", end="")
 
         if copied:
             copied_count += 1
@@ -621,17 +616,11 @@ for same_stem_files in same_stem_groups:
                 print("COPIED", end="")
         else:
             duplicate_count += 1
-            print(
-                f"DUPLICATE OF {destination_file.name}",
-                end="",
-            )
+            print(f"DUPLICATE OF {destination_file.name}", end="")
 
         if same_stem_file in review_reasons:
             review_count += 1
-            print(
-                f"; REVIEW: {review_reasons[same_stem_file]}",
-                end="",
-            )
+            print(f"; REVIEW: {review_reasons[same_stem_file]}", end="")
         else:
             print(
                 f"; {selected_file_date[1].strftime('%Y-%m-%d %H:%M:%S')} "
@@ -639,6 +628,8 @@ for same_stem_files in same_stem_groups:
                 end="",
             )
         print()
+
+# Final report
 
 print()
 print(f"Classified directory: {classified_directory}")

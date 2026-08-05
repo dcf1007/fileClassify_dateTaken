@@ -2,7 +2,7 @@
 
 `fileClassify_dateTaken` is an interactive Python script that classifies files by their best available date while preserving the original source files.
 
-Current version: **0.3.0**
+Current version: **0.3.1**
 
 ## Requirements
 
