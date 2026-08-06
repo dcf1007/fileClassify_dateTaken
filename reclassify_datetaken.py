@@ -1,12 +1,12 @@
 """
-Classify files by their best available timestamp without modifying the sources.
+Classify related files by their best available datetime without modifying sources.
 
 The script scans one selected directory without recursion, groups related files,
-reads an explicit set of metadata timestamps through one persistent ExifTool
-process, resolves conflicting timestamps interactively, and copies each file to
-either a date-based classified directory or an unclassified review directory.
-Existing output files are never overwritten: identical copies are reused and
-non-identical name collisions receive numeric suffixes.
+reads each complete group through one persistent ExifTool process, resolves
+conflicting datetimes interactively, and copies every group member to either a
+date-based classified directory or the unclassified review directory. Existing
+output files are never overwritten: identical copies are reused and non-identical
+name collisions receive numeric suffixes.
 """
 
 import re
@@ -21,36 +21,35 @@ from exiftool.exceptions import ExifToolException, ExifToolExecuteError
 
 # Constants and metadata-reading policy
 
-VERSION = "0.3.2"
-
-# A larger value represents a stronger timestamp source when several sources
-# agree on the same datetime. Filesystem modification time remains a fallback;
-# approved embedded metadata is considered authoritative when available.
-DATETYPE = {0: "OS_DATE", 1: "EXIF"}
+VERSION = "0.3.3"
 
 # This is an inclusion list, not a broad metadata query followed by filtering.
-# Only these reviewed fields may enter timestamp comparison and classification.
-# Additional fields must be added explicitly when their semantics are approved.
-METADATA_TIME_TAGS = [
+# Only these reviewed embedded datetime fields may enter classification. New
+# fields must be added explicitly after their semantics and priority are agreed.
+METADATA_DATETIME_TAGS = [
     "ExifIFD:DateTimeOriginal",
     "ExifIFD:CreateDate",
     "IFD0:ModifyDate",
 ]
 
-# These non-timestamp fields determine whether ExifTool identified an image and
-# whether it reported a metadata-reading problem. They preserve the distinction
-# between an ordinary non-image file, which may use filesystem modification
-# time, and a damaged or unreadable recognized image, which requires review.
-EXIFTOOL_FILE_STATUS_TAGS = [
-    "File:MIMEType",
+# FileModifyDate is acquired in the same ExifTool call as embedded metadata for
+# every successfully inspected file. It remains fallback-only in this version:
+# it is used only when that file supplies no approved embedded datetime.
+FILE_MODIFY_DATE_TAG = [
+    "File:FileModifyDate",
+]
+
+# ExifTool-reported errors make the complete related group unreliable. MIME type
+# and filename extension are deliberately not used to decide whether a file may
+# contribute metadata or use FileModifyDate as its fallback.
+EXIFTOOL_STATUS_TAGS = [
     "ExifTool:Error",
 ]
 
-# The persistent ExifTool process uses the same arguments for every file:
+# The persistent ExifTool process uses the same arguments for every group:
 #
 # - -G:0:1:2:7 retains the approved group families in each returned key so the
-#   complete metadata path remains available for record identity and conflict
-#   reporting.
+#   complete metadata path remains available for record identity and reporting.
 # - -a allows ExifTool to return duplicate tag instances instead of selecting
 #   only one value.
 # - -e suppresses generated Composite tags so only directly requested evidence
@@ -58,7 +57,7 @@ EXIFTOOL_FILE_STATUS_TAGS = [
 # - -ee3 examines supported embedded metadata structures at the selected depth.
 #
 # Print conversion remains enabled. No global -n, -d, or QuickTimeUTC option is
-# applied because those options could alter or impose timestamp interpretation.
+# applied because those options could alter or impose datetime interpretation.
 EXIFTOOL_COMMON_ARGS = [
     "-G:0:1:2:7",
     "-a",
@@ -71,7 +70,7 @@ EXIFTOOL_COMMON_ARGS = [
 # Fractional seconds are deliberately non-capturing because classification uses
 # whole-second precision. The offset and UTC groups remain distinct so +00:00
 # is not collapsed into an explicit Z representation.
-METADATA_TIMESTAMP_PATTERN = re.compile(
+METADATA_DATETIME_PATTERN = re.compile(
     r"^(?P<year>\d{4}):"
     r"(?P<month>\d{2}):"
     r"(?P<day>\d{2}) "
@@ -89,90 +88,13 @@ UNCLASSIFIED_FOLDER_NAME = "unclassified"
 # loaded fully into memory.
 COPY_CHUNK_SIZE = 1024 * 1024
 
-# This static set is the case-folded equivalent of the extension keys returned
-# by PIL.Image.registered_extensions() in version 0.2.0. It is intentionally
-# retained as a compatibility boundary: if ExifTool cannot identify a file with
-# one of these extensions, the file is treated as a potentially damaged image
-# and sent for review instead of being classified as an ordinary non-image file.
-IMAGE_EXTENSIONS = {
-    ".apng",
-    ".avif",
-    ".avifs",
-    ".blp",
-    ".bmp",
-    ".bufr",
-    ".bw",
-    ".cur",
-    ".dcx",
-    ".dds",
-    ".dib",
-    ".emf",
-    ".eps",
-    ".fit",
-    ".fits",
-    ".flc",
-    ".fli",
-    ".ftc",
-    ".ftu",
-    ".gbr",
-    ".gif",
-    ".grib",
-    ".h5",
-    ".hdf",
-    ".icb",
-    ".icns",
-    ".ico",
-    ".iim",
-    ".im",
-    ".j2c",
-    ".j2k",
-    ".jfif",
-    ".jp2",
-    ".jpc",
-    ".jpe",
-    ".jpeg",
-    ".jpf",
-    ".jpg",
-    ".jpx",
-    ".mpeg",
-    ".mpg",
-    ".mpo",
-    ".msp",
-    ".palm",
-    ".pbm",
-    ".pcd",
-    ".pcx",
-    ".pdf",
-    ".pfm",
-    ".pgm",
-    ".png",
-    ".pnm",
-    ".ppm",
-    ".ps",
-    ".psd",
-    ".pxr",
-    ".qoi",
-    ".ras",
-    ".rgb",
-    ".rgba",
-    ".sgi",
-    ".tga",
-    ".tif",
-    ".tiff",
-    ".vda",
-    ".vst",
-    ".webp",
-    ".wmf",
-    ".xbm",
-    ".xpm",
-}
 
-# Metadata parsing and reading
+# Metadata parsing, acquisition, and option construction
 
 
-def parse_metadata_timestamp(metadata_value):
+def parse_metadata_datetime(metadata_value):
     """
-    Parse one complete ExifTool timestamp into separate semantic components.
+    Parse one complete ExifTool datetime into separate semantic components.
 
     ``metadata_value`` may contain whole seconds, any number of fractional
     digits, an optional signed ``HH:MM`` offset, or explicit ``Z``/``z`` UTC
@@ -185,29 +107,29 @@ def parse_metadata_timestamp(metadata_value):
     invalid. The function performs no filesystem access and changes no metadata.
     """
     value_text = str(metadata_value).strip()
-    timestamp_match = METADATA_TIMESTAMP_PATTERN.fullmatch(value_text)
+    datetime_match = METADATA_DATETIME_PATTERN.fullmatch(value_text)
 
-    if timestamp_match is None:
+    if datetime_match is None:
         raise ValueError(
-            f"unsupported metadata timestamp format: {metadata_value!r}"
+            f"unsupported metadata datetime format: {metadata_value!r}"
         )
 
     # Constructing date and time objects performs calendar and clock validation.
     # Fractional seconds matched by the pattern are intentionally not passed to
     # time(), so every accepted value is normalized to whole-second precision.
     parsed_date = date(
-        int(timestamp_match.group("year")),
-        int(timestamp_match.group("month")),
-        int(timestamp_match.group("day")),
+        int(datetime_match.group("year")),
+        int(datetime_match.group("month")),
+        int(datetime_match.group("day")),
     )
     parsed_time = time(
-        int(timestamp_match.group("hour")),
-        int(timestamp_match.group("minute")),
-        int(timestamp_match.group("second")),
+        int(datetime_match.group("hour")),
+        int(datetime_match.group("minute")),
+        int(datetime_match.group("second")),
     )
 
-    offset_text = timestamp_match.group("offset")
-    utc = timestamp_match.group("utc") is not None
+    offset_text = datetime_match.group("offset")
+    utc = datetime_match.group("utc") is not None
 
     # Missing timezone information and explicit UTC are both represented with
     # offset_minutes=None, but the utc flag distinguishes those two meanings.
@@ -221,7 +143,7 @@ def parse_metadata_timestamp(metadata_value):
         # before converting the signed offset into total minutes.
         if offset_hours > 23 or offset_remainder_minutes > 59:
             raise ValueError(
-                f"invalid UTC offset in metadata timestamp: "
+                f"invalid UTC offset in metadata datetime: "
                 f"{metadata_value!r}"
             )
 
@@ -233,212 +155,274 @@ def parse_metadata_timestamp(metadata_value):
     return parsed_date, parsed_time, offset_minutes, utc
 
 
-def get_dates(metadata_reader, filename):
+def read_related_files_metadata(metadata_reader, related_files):
     """
-    Read one file and return timestamps eligible for current classification.
+    Read and normalize metadata for one complete related-file group.
 
-    ``metadata_reader`` is the persistent ``ExifToolHelper`` owned by ``main``;
-    ``filename`` is a regular source file from the non-recursive input snapshot.
-    The function reads but never modifies the file or its metadata.
+    ``metadata_reader`` is the persistent ``ExifToolHelper`` owned by ``main``.
+    ``related_files`` is one complete group from the fixed, non-recursive source
+    snapshot. ExifTool receives every group member in one call and returns one
+    dictionary per requested file. Each dictionary's ``SourceFile`` value binds
+    the returned fields to their source file.
 
-    Return ``(classification_timestamps, review_reason)``. Each classification
-    timestamp is ``(date_type, datetime_value, source_name)``, where
-    ``source_name`` is the complete ExifTool path. A non-``None`` review reason
-    means the file must be copied to ``unclassified`` rather than classified.
+    Return a dictionary keyed first by source file and then by fully qualified
+    ExifTool path. Each field retains its path components, terminal tag name,
+    original ExifTool values, and synchronized lists reserved for parsed date,
+    time, offset, and UTC values.
 
-    Every returned occurrence of an approved metadata field is first stored in
-    ``metadata_timestamps``. Each path owns parallel lists; equal indexes across
-    ``exiftool_values``, ``dates``, ``times``, ``offsets``, and ``utc_flags``
-    describe the same ExifTool occurrence. Parsing finishes before appending so
-    the lists cannot become desynchronized after an invalid value.
-
-    The filesystem modification time is used only when no approved embedded
-    timestamp is available or when the file is an ordinary non-image. A damaged,
-    unreadable, or invalid recognized image is returned for manual review instead
-    of being classified from potentially misleading fallback information.
+    Raise ``ValueError`` when ExifTool returns an incomplete, duplicated, or
+    inconsistent group result, or reports an error for any group member.
+    ``ExifToolExecuteError`` is allowed to propagate so ``main`` can route the
+    complete group to review. Other ``ExifToolException`` failures remain under
+    the persistent-session error boundary in ``main``.
     """
-    # Extension recognition is independent from ExifTool MIME detection. It is
-    # used only as a compatibility safeguard when metadata inspection fails or
-    # cannot identify content that has a historically recognized image suffix.
-    recognized_extension = filename.suffix.casefold() in IMAGE_EXTENSIONS
-
-    # Phase 1: verify that the operating system permits direct source reads.
-    # Permission failures are processing errors. Other read failures on a known
-    # image extension require review; an ordinary non-image may still use its
-    # filesystem modification time, preserving established fallback behavior.
-    try:
-        with filename.open("rb"):
-            pass
-    except PermissionError as error:
-        raise OSError(f"cannot read '{filename}': {error}") from error
-    except OSError as error:
-        if recognized_extension:
-            return [], f"could not inspect image metadata ({error})"
-        modification_date = datetime.fromtimestamp(filename.stat().st_mtime)
-        return [(0, modification_date, DATETYPE[0])], None
-
-    # Phase 2: request only the approved timestamp and status fields through the
-    # already-running ExifTool process. Execute errors may describe malformed
-    # content; general helper errors indicate that metadata could not be read.
-    try:
-        metadata_results = metadata_reader.get_tags(
-            files=filename,
-            tags=METADATA_TIME_TAGS + EXIFTOOL_FILE_STATUS_TAGS,
-        )
-    except ExifToolExecuteError as error:
-        if recognized_extension:
-            return [], f"could not inspect image metadata ({error})"
-        modification_date = datetime.fromtimestamp(filename.stat().st_mtime)
-        return [(0, modification_date, DATETYPE[0])], None
-    except ExifToolException as error:
-        raise OSError(
-            f"could not read metadata from '{filename}': {error}"
-        ) from error
-
-    # No result means ExifTool supplied no usable identification. Recognized
-    # image extensions are reviewed; other files retain the filesystem fallback.
-    if not metadata_results:
-        if recognized_extension:
-            return [], "ExifTool could not identify the image"
-        modification_date = datetime.fromtimestamp(filename.stat().st_mtime)
-        return [(0, modification_date, DATETYPE[0])], None
-
-    # Phase 3: normalize the single-file ExifTool result without shortening any
-    # returned path. PyExifTool values may be scalars or lists. Store one record
-    # per non-null occurrence so duplicate values remain separate and ordered.
-    metadata_records = []
-    mime_type = None
-    metadata_error = None
-
-    for metadata_path, metadata_value in metadata_results[0].items():
-        if metadata_path == "SourceFile":
-            continue
-
-        tag_name = metadata_path.rsplit(":", 1)[-1]
-        metadata_values = (
-            metadata_value
-            if isinstance(metadata_value, list)
-            else [metadata_value]
-        )
-
-        for value in metadata_values:
-            if value is None:
-                continue
-
-            metadata_records.append((metadata_path, tag_name, value))
-
-            # Status fields are matched by terminal name because every returned
-            # dictionary key retains the complete selected ExifTool group path.
-            # The first non-null status value is sufficient for routing.
-            if tag_name == "MIMEType":
-                if mime_type is None and isinstance(value, str):
-                    mime_type = value
-            elif tag_name == "Error" and metadata_error is None:
-                metadata_error = value
-
-    identified_image = (
-        isinstance(mime_type, str)
-        and mime_type.casefold().startswith("image/")
+    exiftool_results = metadata_reader.get_tags(
+        files=related_files,
+        tags=(
+            METADATA_DATETIME_TAGS
+            + FILE_MODIFY_DATE_TAG
+            + EXIFTOOL_STATUS_TAGS
+        ),
     )
 
-    # ExifTool-reported errors route recognized images to review. For ordinary
-    # non-images, the same error does not make embedded image metadata relevant,
-    # so classification continues with filesystem modification time.
-    if metadata_error is not None:
-        if identified_image or recognized_extension:
-            return [], f"could not inspect image metadata ({metadata_error})"
-        modification_date = datetime.fromtimestamp(filename.stat().st_mtime)
-        return [(0, modification_date, DATETYPE[0])], None
+    # PyExifTool always returns a list containing one dictionary for each file
+    # passed to get_tags(). Because this call submits the complete related group,
+    # the result count must match the requested file count before any result is
+    # trusted or parsed.
+    if len(exiftool_results) != len(related_files):
+        raise ValueError(
+            f"ExifTool returned {len(exiftool_results)} file results "
+            f"for a related group containing {len(related_files)} files"
+        )
 
-    # A known image extension without an image MIME type is treated as damaged
-    # or unreadable. A file that is neither identified nor named as an image is
-    # an ordinary non-image and uses filesystem modification time.
-    if not identified_image:
-        if recognized_extension:
-            return [], "ExifTool could not identify the image"
-        modification_date = datetime.fromtimestamp(filename.stat().st_mtime)
-        return [(0, modification_date, DATETYPE[0])], None
-
-    # Phase 4: parse all approved timestamp occurrences into one canonical
-    # per-path representation. Terminal names select the approved fields, while
-    # complete returned paths remain the authoritative identity and display name.
-    metadata_time_names = {
-        metadata_path.rsplit(":", 1)[-1]
-        for metadata_path in METADATA_TIME_TAGS
+    # The requested names are converted once to their terminal tag names because
+    # ExifTool returns fully qualified paths whose preceding components vary by
+    # metadata family and embedded-document location.
+    metadata_datetime_tag_names = {
+        requested_tag.rsplit(":", 1)[-1]
+        for requested_tag in METADATA_DATETIME_TAGS + FILE_MODIFY_DATE_TAG
     }
-    metadata_timestamps = {}
 
-    for metadata_path, tag_name, metadata_value in metadata_records:
-        if tag_name not in metadata_time_names:
-            continue
+    related_files_metadata = {}
 
-        try:
-            (
-                parsed_date,
-                parsed_time,
-                parsed_offset,
-                parsed_utc,
-            ) = parse_metadata_timestamp(metadata_value)
-        except (TypeError, ValueError) as error:
-            return [], (
-                f"invalid {metadata_path} date "
-                f"{metadata_value!r} ({error})"
+    for exiftool_result in exiftool_results:
+        # SourceFile identifies which requested file produced this result. It is
+        # ExifTool control information rather than datetime evidence, so it is
+        # used for association and is not stored as a metadata field.
+        source_file_value = exiftool_result.get("SourceFile")
+
+        if source_file_value is None:
+            raise ValueError(
+                "ExifTool returned a related-file result without SourceFile"
             )
 
-        path_parts = metadata_path.split(":")
-        metadata_timestamp = metadata_timestamps.setdefault(
-            metadata_path,
-            {
-                "path_components": path_parts[:-1],
-                "tag_name": path_parts[-1],
-                "exiftool_values": [],
+        source_file = Path(source_file_value)
+
+        if source_file not in related_files:
+            raise ValueError(
+                f"ExifTool returned an unexpected source file: '{source_file}'"
+            )
+
+        # The directory snapshot cannot contain the same file twice. This check
+        # instead verifies ExifTool's result contract: a duplicate result for one
+        # file would mean another requested group member has no result.
+        if source_file in related_files_metadata:
+            raise ValueError(
+                f"ExifTool returned more than one result for '{source_file}'"
+            )
+
+        source_file_metadata = {}
+
+        for qualified_metadata_path, returned_value in exiftool_result.items():
+            if qualified_metadata_path == "SourceFile":
+                continue
+
+            # PyExifTool may represent one value as a scalar and several values
+            # as a list. Normalize both forms once at this input boundary so all
+            # later processing uses the same ordered occurrence representation.
+            returned_values = (
+                returned_value
+                if isinstance(returned_value, list)
+                else [returned_value]
+            )
+            returned_values = [
+                value for value in returned_values if value is not None
+            ]
+
+            if not returned_values:
+                continue
+
+            path_components = qualified_metadata_path.split(":")
+            tag_name = path_components[-1]
+
+            # Any ExifTool-reported error makes the complete related group
+            # unreliable. Preserve every non-null reported value in the review
+            # explanation rather than silently selecting only the first one.
+            if tag_name == "Error":
+                error_description = ", ".join(
+                    repr(value) for value in returned_values
+                )
+                raise ValueError(
+                    f"ExifTool reported an error for '{source_file.name}' at "
+                    f"{qualified_metadata_path}: {error_description}"
+                )
+
+            # Only requested datetime evidence enters the normalized structure.
+            # No broad result set is retained and filtered again downstream.
+            if tag_name not in metadata_datetime_tag_names:
+                continue
+
+            source_file_metadata[qualified_metadata_path] = {
+                "path_components": path_components[:-1],
+                "tag_name": tag_name,
+                "exiftool_values": returned_values,
                 "dates": [],
                 "times": [],
                 "offsets": [],
                 "utc_flags": [],
-            },
-        )
+            }
 
-        # These parallel lists form one explicit invariant: the same index in
-        # every list refers to the same occurrence returned for this exact path.
-        metadata_timestamp["exiftool_values"].append(metadata_value)
-        metadata_timestamp["dates"].append(parsed_date)
-        metadata_timestamp["times"].append(parsed_time)
-        metadata_timestamp["offsets"].append(parsed_offset)
-        metadata_timestamp["utc_flags"].append(parsed_utc)
+        related_files_metadata[source_file] = source_file_metadata
 
-    # Phase 5: adapt complete metadata timestamps to the current classifier's
-    # established tuple interface. Offsets and explicit UTC state are preserved
-    # in metadata_timestamps but deliberately do not shift the local datetime.
-    # Classification therefore uses the represented wall-clock date and time.
-    classification_timestamps = []
+    return related_files_metadata
 
-    for metadata_path, metadata_timestamp in metadata_timestamps.items():
-        for candidate_index, candidate_date in enumerate(
-            metadata_timestamp["dates"]
-        ):
-            candidate_time = metadata_timestamp["times"][candidate_index]
 
-            # The current classifier accepts only complete date-and-time values.
-            # Any incomplete occurrence is not eligible for classification.
-            if candidate_date is None or candidate_time is None:
+def build_datetime_options(related_files_metadata):
+    """
+    Parse group metadata and return distinct classification datetime options.
+
+    ``related_files_metadata`` is the normalized evidence returned by
+    ``read_related_files_metadata``. Each source file is evaluated independently.
+    Approved embedded datetimes have priority. ``FileModifyDate`` was already
+    acquired for the file but is parsed and used only when that file supplies no
+    approved embedded datetime.
+
+    Return a dictionary keyed by combined ``datetime``. Each option retains a
+    list of ``(source_file, qualified_metadata_path)`` tuples for every field
+    occurrence supporting that value. Equal datetimes therefore agree while
+    their exact contributing files and paths remain available for reporting.
+
+    Raise ``ValueError`` when an evaluated datetime is invalid or when any source
+    file has neither approved embedded datetime evidence nor a usable
+    ``FileModifyDate``. Parsing appends all semantic components together so the
+    synchronized lists in each metadata field cannot become misaligned.
+    """
+    # These terminal names identify embedded datetime fields. FileModifyDate is
+    # deliberately excluded because it is considered only after this set yields
+    # no candidate for the current source file.
+    embedded_datetime_tag_names = {
+        requested_tag.rsplit(":", 1)[-1]
+        for requested_tag in METADATA_DATETIME_TAGS
+    }
+
+    datetime_options = {}
+
+    for source_file, source_file_metadata in related_files_metadata.items():
+        embedded_datetime_found = False
+
+        # Parse every approved embedded datetime occurrence before considering
+        # the fallback. A present invalid value makes the evidence unreliable;
+        # it is not silently ignored in favor of another field or FileModifyDate.
+        for qualified_metadata_path, metadata_field in source_file_metadata.items():
+            if metadata_field["tag_name"] not in embedded_datetime_tag_names:
                 continue
 
-            classification_timestamps.append(
-                (
-                    1,
-                    datetime.combine(candidate_date, candidate_time),
-                    metadata_path,
+            for raw_datetime_value in metadata_field["exiftool_values"]:
+                try:
+                    (
+                        parsed_date,
+                        parsed_time,
+                        parsed_offset,
+                        parsed_utc,
+                    ) = parse_metadata_datetime(raw_datetime_value)
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        f"invalid {qualified_metadata_path} datetime "
+                        f"{raw_datetime_value!r} for '{source_file.name}' "
+                        f"({error})"
+                    ) from error
+
+                # Equal indexes across these lists describe the same ExifTool
+                # occurrence. Append only after the complete value has parsed.
+                metadata_field["dates"].append(parsed_date)
+                metadata_field["times"].append(parsed_time)
+                metadata_field["offsets"].append(parsed_offset)
+                metadata_field["utc_flags"].append(parsed_utc)
+
+                embedded_datetime_found = True
+                datetime_value = datetime.combine(parsed_date, parsed_time)
+                datetime_option = datetime_options.setdefault(
+                    datetime_value,
+                    {"sources": []},
                 )
+
+                # Each source has the fixed structure:
+                #
+                #     (source_file, qualified_metadata_path)
+                #
+                # The file and complete path are both retained because conflict
+                # explanations must identify the exact origin of every value.
+                datetime_option["sources"].append(
+                    (source_file, qualified_metadata_path)
+                )
+
+        if embedded_datetime_found:
+            continue
+
+        file_modify_datetime_found = False
+
+        # FileModifyDate was acquired in the same ExifTool operation but remains
+        # unused until this point. It is the final fallback only when the current
+        # file supplied no approved embedded datetime.
+        for qualified_metadata_path, metadata_field in source_file_metadata.items():
+            if metadata_field["tag_name"] != "FileModifyDate":
+                continue
+
+            for raw_datetime_value in metadata_field["exiftool_values"]:
+                try:
+                    (
+                        parsed_date,
+                        parsed_time,
+                        parsed_offset,
+                        parsed_utc,
+                    ) = parse_metadata_datetime(raw_datetime_value)
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        f"invalid {qualified_metadata_path} datetime "
+                        f"{raw_datetime_value!r} for '{source_file.name}' "
+                        f"({error})"
+                    ) from error
+
+                metadata_field["dates"].append(parsed_date)
+                metadata_field["times"].append(parsed_time)
+                metadata_field["offsets"].append(parsed_offset)
+                metadata_field["utc_flags"].append(parsed_utc)
+
+                file_modify_datetime_found = True
+                datetime_value = datetime.combine(parsed_date, parsed_time)
+                datetime_option = datetime_options.setdefault(
+                    datetime_value,
+                    {"sources": []},
+                )
+                datetime_option["sources"].append(
+                    (source_file, qualified_metadata_path)
+                )
+
+        if not file_modify_datetime_found:
+            raise ValueError(
+                f"ExifTool returned no approved embedded datetime or "
+                f"FileModifyDate for '{source_file.name}'"
             )
 
-    if classification_timestamps:
-        return classification_timestamps, None
+    # Every successfully evaluated file contributes embedded evidence or its
+    # FileModifyDate fallback. An empty result would therefore violate the
+    # function's contract rather than represent a valid classification state.
+    if not datetime_options:
+        raise ValueError(
+            "the related group contains no usable datetime evidence"
+        )
 
-    # An identified image with no approved embedded timestamp is valid rather
-    # than damaged, so filesystem modification time remains its final fallback.
-    modification_date = datetime.fromtimestamp(filename.stat().st_mtime)
-    return [(0, modification_date, DATETYPE[0])], None
+    return datetime_options
 
 
 # Related-file grouping
@@ -492,6 +476,9 @@ def group_related_files(files):
     )
 
     for stem in sorted_stems:
+        # Collect every established base that can own this derivative. The most
+        # specific match is selected afterward; stopping at the first match would
+        # make dictionary iteration order affect the relationship decision.
         matching_bases = [
             base_stem
             for base_stem in groups
@@ -505,14 +492,19 @@ def group_related_files(files):
         else:
             groups[stem] = list(files_by_stem[stem])
 
-    # Stable ordering keeps prompts and reports reproducible across runs.
-    return [
-        sorted(group, key=lambda path: path.name.casefold())
-        for _, group in sorted(
-            groups.items(),
-            key=lambda item: item[0].casefold(),
+    related_file_groups = []
+
+    # Sort base stems first so groups have a stable case-insensitive order. Sort
+    # each group's files separately so both ordering levels remain explicit
+    # instead of being combined in one nested comprehension.
+    for base_stem in sorted(groups, key=str.casefold):
+        related_files = sorted(
+            groups[base_stem],
+            key=lambda path: path.name.casefold(),
         )
-    ]
+        related_file_groups.append(related_files)
+
+    return related_file_groups
 
 
 # Safe output copying
@@ -621,13 +613,14 @@ def main():
 
     The function prompts for one source directory, validates and snapshots its
     direct regular files, groups related names, and opens one persistent
-    ``ExifToolHelper`` context for all metadata reads. Each group is assigned one
-    selected timestamp before its files are copied to ``classified/YYYY-MM-DD``;
-    unreliable recognized images are copied to ``unclassified`` for review.
+    ``ExifToolHelper`` context for all metadata reads. Each complete related
+    group is acquired in one ExifTool call and receives one routing decision:
+    either one selected datetime for ``classified/YYYY-MM-DD`` or one review
+    reason for ``unclassified``.
 
     The source files are never moved, renamed, deleted, or opened for writing.
     Return exit code 0 on complete success, 1 when setup or the ExifTool session
-    cannot be established, and 2 when one or more individual files fail.
+    cannot be established, and 2 when one or more output copies fail.
     """
     # Source-directory input and validation
 
@@ -661,7 +654,7 @@ def main():
     # The script writes copies only below these two fixed destinations:
     #
     #   classified/YYYY-MM-DD/  successfully classified copies
-    #   unclassified/           files requiring manual metadata review
+    #   unclassified/           complete groups requiring metadata review
     #
     # Existing directories are reused. An ordinary file occupying either name
     # is a setup conflict because the required directory cannot be created.
@@ -681,10 +674,10 @@ def main():
         classified_directory.mkdir(exist_ok=True)
         unclassified_directory.mkdir(exist_ok=True)
 
-        # Take one fixed, non-recursive snapshot before classification begins.
-        # Output directories and every other subdirectory are excluded because
-        # only direct regular, non-symlink files pass this filter. Newly created
-        # copies therefore cannot enter the same run as new inputs.
+        # Take one fixed, non-recursive snapshot before classification starts.
+        # The generator includes only direct regular, non-symlink files. Sorting
+        # case-insensitively keeps grouping, prompts, and reports deterministic.
+        # Newly created output copies cannot enter this already-built snapshot.
         source_files = sorted(
             (
                 filename
@@ -700,10 +693,10 @@ def main():
 
     # Related-file grouping and run counters
 
-    # Related files are processed as a unit because image derivatives and
-    # sidecars must receive the same selected date directory. Counters describe
-    # output actions rather than source discovery totals.
-    same_stem_groups = group_related_files(source_files)
+    # Related files are processed as one unit because originals, derivatives,
+    # sidecars, and other same-stem companions must receive the same destination.
+    # Counters describe completed output actions rather than discovery totals.
+    related_file_groups = group_related_files(source_files)
 
     copied_count = 0
     duplicate_count = 0
@@ -714,195 +707,175 @@ def main():
     # Persistent metadata session and per-group classification
 
     # Entering the context starts one stay-open ExifTool process after all setup
-    # checks have passed. The same helper is passed to every get_dates() call.
+    # checks have passed. The same helper handles every group-level acquisition.
     # Leaving the context terminates the process on normal completion or when an
     # exception exits the block, so no manual run()/terminate() pair is needed.
     try:
         with ExifToolHelper(
             common_args=EXIFTOOL_COMMON_ARGS
         ) as metadata_reader:
-            # Each group follows one linear sequence: collect evidence, combine
-            # equal timestamps, resolve conflicts, select destinations, and copy.
-            for same_stem_files in same_stem_groups:
-                file_dates = {}
-                review_reasons = {}
-                selected_file_date = None
+            # Each group follows one linear sequence: acquire all members,
+            # normalize evidence, build datetime options, resolve any conflict,
+            # establish one destination, and copy every member.
+            for related_files in related_file_groups:
+                review_reason = None
+                selected_datetime = None
 
-                # Metadata collection for the complete related group
+                # Metadata acquisition and datetime-option construction
 
-                # Read every file before deciding the group timestamp. This
-                # exposes disagreements between different files and between
-                # multiple approved fields inside a single file.
-                for same_stem_file in same_stem_files:
-                    try:
-                        classification_timestamps, review_reason = get_dates(
-                            metadata_reader,
-                            same_stem_file,
-                        )
-                    except OSError as error:
-                        # A processing failure prevents this file from being
-                        # copied because neither classification nor review
-                        # routing can be trusted. Other files continue.
-                        print(
-                            f"Error reading '{same_stem_file.name}': {error}",
-                            file=sys.stderr,
-                        )
-                        failed_count += 1
-                        continue
-
-                    if review_reason is not None:
-                        # Review files are excluded from timestamp consensus but
-                        # retained for copying into the unclassified directory.
-                        print(
-                            f"Warning: '{same_stem_file.name}' requires review: "
-                            f"{review_reason}",
-                            file=sys.stderr,
-                        )
-                        review_reasons[same_stem_file] = review_reason
-                        continue
-
-                    # Preserve every eligible occurrence returned for the file.
-                    # A single file may therefore contribute several distinct
-                    # options when its approved metadata fields disagree.
-                    file_dates[same_stem_file] = classification_timestamps
-
-                # Timestamp consolidation across files and metadata fields
-
-                # Use the datetime itself as the consensus key. Sources are not
-                # part of that key: two fields containing the same timestamp
-                # agree and should not force a prompt. Their file names and full
-                # metadata paths are retained solely for explanation to the user.
-                date_options = {}
-                for same_stem_file, classification_timestamps in file_dates.items():
-                    for (
-                        date_type,
-                        date_value,
-                        source_name,
-                    ) in classification_timestamps:
-                        date_option = date_options.setdefault(
-                            date_value,
-                            {"date_type": date_type, "sources": []},
-                        )
-                        date_option["date_type"] = max(
-                            date_option["date_type"],
-                            date_type,
-                        )
-                        date_option["sources"].append(
-                            (same_stem_file, source_name)
-                        )
-
-                # Authoritative timestamp selection
-
-                if len(date_options) == 1:
-                    # Complete agreement requires no interaction. If the same
-                    # datetime came from both filesystem and metadata sources,
-                    # retain the strongest source type for the final report.
-                    date_value, date_option = next(iter(date_options.items()))
-                    selected_file_date = (
-                        date_option["date_type"],
-                        date_value,
+                try:
+                    related_files_metadata = read_related_files_metadata(
+                        metadata_reader,
+                        related_files,
+                    )
+                    datetime_options = build_datetime_options(
+                        related_files_metadata
                     )
 
-                elif len(date_options) > 1:
-                    # Conflicts may be within one file, between related files, or
-                    # both. Present one option per distinct datetime and list all
-                    # contributing paths before accepting a bounded numeric choice.
-                    sorted_date_options = sorted(date_options.items())
+                except ExifToolExecuteError as error:
+                    # A batch execution failure means ExifTool could not inspect
+                    # the complete group. Partial evidence is deliberately not
+                    # used because one inaccessible member makes group routing
+                    # unreliable.
+                    review_reason = (
+                        "ExifTool could not inspect every file in the related "
+                        f"group ({error})"
+                    )
 
-                    print()
-                    print("Conflicting dates found for this related group:")
-                    for same_stem_file in same_stem_files:
-                        print(f"  - {same_stem_file.name}")
+                except ValueError as error:
+                    # Structural result violations, reported metadata errors, and
+                    # invalid or missing datetime evidence all require review of
+                    # the complete group rather than a per-file fallback.
+                    review_reason = str(error)
 
-                    print("Choose the date that should be used for this group:")
-                    for option_number, (date_value, date_option) in enumerate(
-                        sorted_date_options,
-                        start=1,
-                    ):
-                        date_sources = ", ".join(
-                            f"{filename.name} ({source_name})"
-                            for filename, source_name in date_option["sources"]
-                        )
+                # Authoritative datetime selection
+
+                if review_reason is None:
+                    if len(datetime_options) == 1:
+                        # Iterating over a dictionary returns its keys. Because
+                        # there is exactly one option, this retrieves its single
+                        # datetime key without copying the dictionary's contents.
+                        selected_datetime = next(iter(datetime_options))
+
+                    else:
+                        # Sorting the datetime keys keeps the numbered options
+                        # deterministic regardless of metadata return order.
+                        available_datetimes = sorted(datetime_options)
+
+                        print()
                         print(
-                            f"  {option_number}. "
-                            f"{date_value.strftime('%Y-%m-%d %H:%M:%S')} "
-                            f"- {date_sources}"
+                            "Conflicting datetimes found for this related group:"
+                        )
+                        for related_file in related_files:
+                            print(f"  - {related_file.name}")
+
+                        print(
+                            "Choose the datetime that should be used for this "
+                            "group:"
                         )
 
-                    while True:
-                        raw_selection = input(
-                            "Enter a number from 1 to "
-                            f"{len(sorted_date_options)}: "
-                        ).strip()
-
-                        try:
-                            selected_option_number = int(raw_selection)
-                        except ValueError:
-                            print(
-                                "Invalid selection. "
-                                "Enter one of the listed numbers."
-                            )
-                            continue
-
-                        if not 1 <= selected_option_number <= len(
-                            sorted_date_options
+                        for option_number, datetime_value in enumerate(
+                            available_datetimes,
+                            start=1,
                         ):
+                            # Each source contains the related file and complete
+                            # ExifTool path that supplied this datetime. Join all
+                            # contributors into one explanation for the option.
+                            datetime_source_description = ", ".join(
+                                f"{source_file.name} "
+                                f"({qualified_metadata_path})"
+                                for (
+                                    source_file,
+                                    qualified_metadata_path,
+                                ) in datetime_options[datetime_value]["sources"]
+                            )
+                            print(
+                                f"  {option_number}. "
+                                f"{datetime_value.strftime('%Y-%m-%d %H:%M:%S')} "
+                                f"- {datetime_source_description}"
+                            )
+
+                        while True:
+                            raw_selection = input(
+                                "Enter a number from 1 to "
+                                f"{len(available_datetimes)}: "
+                            ).strip()
+
+                            try:
+                                selected_option_index = int(raw_selection) - 1
+                            except ValueError:
+                                selected_option_index = -1
+
+                            if 0 <= selected_option_index < len(
+                                available_datetimes
+                            ):
+                                selected_datetime = available_datetimes[
+                                    selected_option_index
+                                ]
+                                break
+
                             print(
                                 "Invalid selection. "
                                 "Enter one of the listed numbers."
                             )
-                            continue
 
-                        (
-                            selected_date_value,
-                            selected_date_option,
-                        ) = sorted_date_options[selected_option_number - 1]
-                        selected_file_date = (
-                            selected_date_option["date_type"],
-                            selected_date_value,
-                        )
                         print(
-                            "Selected date: "
-                            f"{selected_date_value.strftime('%Y-%m-%d %H:%M:%S')}"
+                            "Selected datetime: "
+                            f"{selected_datetime.strftime('%Y-%m-%d %H:%M:%S')}"
                         )
                         print()
-                        break
 
-                # Destination routing and non-destructive copying
+                # Destination routing
 
-                # Review routing has priority for the affected file. Other usable
-                # files in the group share the one selected group timestamp. A
-                # file that failed metadata reading is absent from both mappings
-                # and is skipped because no safe destination was established.
-                for same_stem_file in same_stem_files:
-                    if same_stem_file in review_reasons:
-                        folder_name = UNCLASSIFIED_FOLDER_NAME
-                        destination_directory = unclassified_directory
-                    elif (
-                        same_stem_file in file_dates
-                        and selected_file_date is not None
-                    ):
-                        date_folder_name = selected_file_date[1].strftime(
-                            "%Y-%m-%d"
-                        )
-                        folder_name = (
-                            f"{CLASSIFIED_FOLDER_NAME}/{date_folder_name}"
-                        )
-                        destination_directory = (
-                            classified_directory / date_folder_name
-                        )
-                    else:
-                        continue
+                # review_reason is both the routing state and the explanation
+                # reported to the user. A separate needs_review boolean or
+                # display-only folder name would duplicate the same decision.
+                if review_reason is not None:
+                    destination_directory = unclassified_directory
+                    print(
+                        "Warning: related group requires review: "
+                        f"{review_reason}",
+                        file=sys.stderr,
+                    )
+                else:
+                    date_folder_name = selected_datetime.strftime("%Y-%m-%d")
+                    destination_directory = (
+                        classified_directory / date_folder_name
+                    )
 
-                    # A file blocking a date-directory path is a per-file output
-                    # failure. It does not justify changing or deleting that file.
+                    selected_datetime_source_groups = set()
+
+                    # Each source has the fixed structure:
+                    #
+                    #     (source_file, qualified_metadata_path)
+                    #
+                    # The source file is used in conflict explanations. This
+                    # final summary needs only the qualified path at index 1;
+                    # its first component identifies the broad ExifTool group.
+                    for datetime_source in datetime_options[selected_datetime]["sources"]:
+                        qualified_metadata_path = datetime_source[1]
+                        source_group = qualified_metadata_path.split(":", 1)[0]
+                        selected_datetime_source_groups.add(source_group)
+
+                    # Sets express unique unordered source groups. Sorting is
+                    # applied only for deterministic presentation.
+                    selected_datetime_source_description = ", ".join(
+                        sorted(selected_datetime_source_groups)
+                    )
+
+                # Non-destructive copying and reporting
+
+                for related_file in related_files:
+                    # A file blocking the selected destination directory is an
+                    # output failure. It does not justify deleting or replacing
+                    # that file, and other group members are still attempted.
                     if (
                         destination_directory.exists()
                         and not destination_directory.is_dir()
                     ):
                         print(
                             f"Error: '{destination_directory}' is a file. "
-                            f"Skipping '{same_stem_file.name}'.",
+                            f"Skipping '{related_file.name}'.",
                             file=sys.stderr,
                         )
                         failed_count += 1
@@ -914,21 +887,26 @@ def main():
                             exist_ok=True,
                         )
                         destination_file, copied, renamed = copy_file_safely(
-                            same_stem_file,
-                            destination_directory / same_stem_file.name,
+                            related_file,
+                            destination_directory / related_file.name,
                         )
                     except OSError as error:
                         print(
-                            f"Error copying '{same_stem_file.name}': {error}",
+                            f"Error copying '{related_file.name}': {error}",
                             file=sys.stderr,
                         )
                         failed_count += 1
                         continue
 
-                    # Report the physical output action first, then append the
-                    # review reason or selected timestamp used for routing.
+                    # Derive the display path from the authoritative destination
+                    # immediately before reporting. No parallel folder label is
+                    # maintained that could diverge from destination_directory.
+                    displayed_destination = destination_directory.relative_to(
+                        directory
+                    )
                     print(
-                        f"{same_stem_file.name}\t--->\t{folder_name}\t",
+                        f"{related_file.name}\t--->\t"
+                        f"{displayed_destination}\t",
                         end="",
                     )
 
@@ -949,17 +927,17 @@ def main():
                             end="",
                         )
 
-                    if same_stem_file in review_reasons:
+                    if review_reason is not None:
                         review_count += 1
                         print(
-                            f"; REVIEW: {review_reasons[same_stem_file]}",
+                            f"; REVIEW: {review_reason}",
                             end="",
                         )
                     else:
                         print(
                             "; "
-                            f"{selected_file_date[1].strftime('%Y-%m-%d %H:%M:%S')} "
-                            f"{DATETYPE[selected_file_date[0]]}",
+                            f"{selected_datetime.strftime('%Y-%m-%d %H:%M:%S')} "
+                            f"{selected_datetime_source_description}",
                             end="",
                         )
                     print()
@@ -976,16 +954,16 @@ def main():
     except ExifToolException as error:
         # PyExifTool may raise while entering, using, or leaving the persistent
         # session. The context manager remains responsible for process cleanup.
-        # Expected per-file execution errors are handled inside get_dates().
+        # Expected group execution errors are handled inside the group loop.
         print(f"Error during ExifTool processing: {error}", file=sys.stderr)
         input("Press Enter to exit")
         return 1
 
     # Final report and exit status
 
-    # Counts describe completed output decisions. Failed files are reported
-    # separately and cause exit code 2, while successful and review copies remain
-    # valid. The final statement reiterates the central source immutability rule.
+    # Counts describe completed output decisions. Failed copies are reported
+    # separately and cause exit code 2, while successful classified and review
+    # copies remain valid. The final statement reiterates source immutability.
     print()
     print(f"Classified directory: {classified_directory}")
     print(f"Unclassified directory: {unclassified_directory}")
